@@ -5,6 +5,21 @@
 
 同时注册两个 agent 工具——`image2_generate`（生成）与 `image2_edit`（改图）——复用同一套配置。
 
+仓库：<https://github.com/Mr-Maidong/dsh-plugin-image2>（topic：`dsh`、`dsh-plugin`、`deepseek-harness`）
+
+## 安装
+
+```bash
+# 从 GitHub 安装
+dsh plugin --profile desktop add git+https://github.com/Mr-Maidong/dsh-plugin-image2.git
+
+# 或用本地克隆
+git clone https://github.com/Mr-Maidong/dsh-plugin-image2.git
+dsh plugin --profile desktop add ./dsh-plugin-image2
+```
+
+Host 半侧在启动时加载，装好需要重启 DSH；之后只改 `client.js` 的话刷新页面即可。
+
 ## 使用
 
 1. 打开左侧栏的「图像生成」图标。**第一次进入会自动弹出接口设置**；已经配好密钥时，设置收在
