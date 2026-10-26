@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Generated pictures: the workspace default output directory, and whatever the
+# user's saved profile points at. Never part of the source.
+imgout/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.log
+
+# Scratch renders from the design harness (the committed assets live in
+# design/shots/ and design/*.webp; these are the throwaway crops taken while
+# inspecting a strip at 4x).
+design/shots/_*.png

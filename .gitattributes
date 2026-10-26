@@ -1,0 +1,11 @@
+# Source files stay LF everywhere: the plugin's own files are LF, and a CRLF
+# checkout would trip the line-ending check the design notes rely on.
+* text=auto eol=lf
+
+# Binary / generated
+*.png binary
+*.jpg binary
+*.webp binary
+*.gif binary
+*.woff binary
+*.woff2 binary

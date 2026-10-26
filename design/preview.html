@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<title>Image studio preview</title>
+<style>
+  :root[data-theme="dark"] {
+    --dsw-alias-bg-base: rgb(21, 21, 23);
+    --dsw-alias-bg-layer-1: rgb(35, 35, 36);
+    --dsw-alias-bg-layer-2: rgb(44, 44, 46);
+    --dsw-alias-border-l1: rgba(255, 255, 255, 0.06);
+    --dsw-alias-border-l2: rgba(255, 255, 255, 0.12);
+    --dsw-alias-label-primary: rgb(249, 250, 251);
+    --dsw-alias-label-secondary: rgb(207, 211, 214);
+    --dsw-alias-brand-primary: rgb(249, 250, 251);
+    --dsw-alias-state-error-primary: rgb(248, 113, 113);
+    --dsw-alias-state-success-primary: rgb(34, 197, 94);
+    color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --dsw-alias-bg-base: #ffffff;
+    --dsw-alias-bg-layer-1: #ffffff;
+    --dsw-alias-bg-layer-2: #ffffff;
+    --dsw-alias-border-l1: rgba(0, 0, 0, 0.04);
+    --dsw-alias-border-l2: rgba(0, 0, 0, 0.1);
+    --dsw-alias-label-primary: rgb(40 49 66 / 92%);
+    --dsw-alias-label-secondary: rgb(97, 102, 107);
+    --dsw-alias-brand-primary: rgb(40 49 66 / 92%);
+    --dsw-alias-state-error-primary: rgb(220, 38, 38);
+    --dsw-alias-state-success-primary: rgb(22, 163, 74);
+    color-scheme: light;
+  }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Microsoft YaHei UI", sans-serif; }
+  #root { height: 100%; }
+
+  /* stand-in for the Harness Button primitive: same variants, sizes and radii */
+  .i2b { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid transparent;
+    font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; white-space: nowrap;
+    transition: background .12s ease, border-color .12s ease, opacity .12s ease; }
+  .i2b-md { height: 36px; padding: 0 14px; border-radius: 12px; }
+  .i2b-sm { height: 28px; padding: 0 10px; border-radius: 8px; font-size: 12px; }
+  .i2b-primary { background: var(--dsw-alias-brand-primary); color: var(--dsw-alias-bg-base); }
+  .i2b-outline { background: transparent; border-color: var(--dsw-alias-border-l2); color: var(--dsw-alias-label-primary); }
+  .i2b-ghost { background: transparent; color: var(--dsw-alias-label-secondary); }
+  .i2b-ghost:hover { background: var(--dsw-alias-bg-layer-2); }
+  .i2b[disabled] { opacity: .5; cursor: default; }
+  .i2b-icon { display: flex; align-items: center; }
+
+  /* stand-in for the harness Menu primitive: same props, rows, and card geometry.
+     The real card chrome (elevation, hover fill tokens) lives in the host bundle,
+     so this stub is for composition only — not for judging the shipped look. */
+  .i2m-card { position: absolute; top: calc(100% + 4px); left: 0; z-index: 1200; min-width: 144px;
+    display: flex; flex-direction: column; padding: 4px; border: 1px solid var(--dsw-alias-border-l1);
+    border-radius: 12px; background: var(--dsw-alias-bg-layer-1);
+    box-shadow: 0 18px 40px -12px rgba(0, 0, 0, .55); }
+  .i2m-item { display: flex; align-items: center; gap: 6px; width: 100%; min-height: 34px; padding: 6px 8px;
+    border: 0; border-radius: 8px; background: transparent; color: var(--dsw-alias-label-primary);
+    font: inherit; font-size: 13px; line-height: 20px; text-align: left; cursor: pointer; }
+  .i2m-item:hover, .i2m-item:focus-visible { outline: none;
+    background: color-mix(in srgb, var(--dsw-alias-label-primary) 8%, transparent); }
+  .i2m-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .i2m-check { flex: none; width: 14px; font-size: 11px; line-height: 14px; text-align: center; }
+</style>
+<script src="./vendor/react.js"></script>
+<script src="./vendor/react-dom.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+  if (window.React === undefined || window.ReactDOM === undefined) {
+    document.getElementById('root').textContent = 'preview harness could not load React from the CDN'
+  }
+  const params = new URLSearchParams(location.search)
+  document.documentElement.dataset.theme = params.get('theme') === 'light' ? 'light' : 'dark'
+  const lang = params.get('lang') === 'en' ? 'en' : 'zh'
+
+  const Button = React.forwardRef(function Button(props, ref) {
+    const { variant = 'ghost', size = 'md', icon = null, className, children, ...rest } = props
+    return React.createElement('button', {
+      ref,
+      type: 'button',
+      className: ['i2b', 'i2b-' + variant, size === 'md' ? 'i2b-md' : 'i2b-sm', className].filter(Boolean).join(' '),
+      ...rest,
+    }, icon === null ? null : React.createElement('span', { className: 'i2b-icon' }, icon), children)
+  })
+
+  const Menu = function Menu(props) {
+    const { open, anchor, items = [], selectedId, onSelect, onClose, className } = props
+    React.useEffect(() => {
+      if (!open) return undefined
+      const onPointerDown = event => {
+        if (event.target.closest('.i2m-card') === null && event.target.closest('.i2-pickerWrap') === null) onClose()
+      }
+      const onKeyDown = event => { if (event.key === 'Escape') onClose() }
+      document.addEventListener('pointerdown', onPointerDown)
+      document.addEventListener('keydown', onKeyDown)
+      return () => {
+        document.removeEventListener('pointerdown', onPointerDown)
+        document.removeEventListener('keydown', onKeyDown)
+      }
+    }, [open, onClose])
+    return React.createElement('span', { className, style: { position: 'relative' } },
+      anchor,
+      open
+        ? React.createElement('div', { className: 'i2m-card', role: 'menu' },
+          items.map(item => React.createElement('button', {
+            key: item.id,
+            type: 'button',
+            role: 'menuitem',
+            className: 'i2m-item',
+            onClick: () => onSelect(item.id),
+          },
+          React.createElement('span', { className: 'i2m-label' }, item.label),
+          item.id === selectedId ? React.createElement('span', { className: 'i2m-check' }, '\u2713') : null)))
+        : null)
+  }
+
+  const dictionaries = {}
+  window.__ModuleLoader__ = {
+    load({ factory }) {
+      const require = spec => {
+        if (spec === 'react') return React
+        if (spec === 'react-dom') return ReactDOM
+        if (spec === '@deepseek-ai/dsh-client-ui-primitives') return { Button, Menu }
+        throw new Error('preview: unsupported module ' + spec)
+      }
+      window.__client = factory(require)
+    },
+  }
+
+  const SETTINGS = {
+    baseUrl: 'https://image.codesonline.dev/v1',
+    model: 'gpt-image-2.5',
+    outputDir: 'C:\\Users\\Yangtao\\Pictures\\image2',
+    quality: 'auto',
+    size: '16:9',
+    background: 'auto',
+    hasApiKey: params.get('nokey') === '1' ? false : true,
+    apiKeyHint: '\u2022\u2022\u2022\u20221234',
+  }
+
+  /* the pictures the gallery stubs: real local files, so the shot shows real pixels */
+  const ASSETS = {
+    p1: 'comp.png',
+    p2: 'shots/result-dark.png',
+    p3: 'shots/empty-light.png',
+    p4: 'shots/empty-dark.png',
+    p5: 'fox.webp',
+    p6: 'comp.png',
+  }
+  const HISTORY = params.get('empty') === '1' ? [] : [
+    { id: 'p1', file: 'C:\\Users\\Yangtao\\Pictures\\image2\\image2-20261025-214119-0j9luq.png', mediaType: 'image/png', bytes: 1221239, size: '1672x940', kind: 'generate', createdAt: '2026-10-25T21:41:19.000Z', prompt: 'A small fox curled up asleep in a snowdrift, soft morning light.', revisedPrompt: 'A small fox curled up asleep in a snowdrift, soft morning light, shallow depth of field.' },
+    { id: 'p2', file: 'C:\\Users\\Yangtao\\Pictures\\image2\\image2-20261025-214002-a1b2c3.png', mediaType: 'image/png', bytes: 308267, size: '1440x1200', kind: 'generate', createdAt: '2026-10-25T21:40:02.000Z', prompt: 'A dark image studio panel on a laptop screen.' },
+    { id: 'p3', file: 'C:\\Users\\Yangtao\\Pictures\\image2\\image2-20261025-213840-d4e5f6.png', mediaType: 'image/png', bytes: 153602, size: '1440x1200', kind: 'generate', createdAt: '2026-10-25T21:38:40.000Z', prompt: 'A light mode settings panel.' },
+    { id: 'p4', file: 'C:\\Users\\Yangtao\\Pictures\\image2\\image2-20261025-213701-g7h8i9.png', mediaType: 'image/png', bytes: 119871, size: '1440x1200', kind: 'edit', createdAt: '2026-10-25T21:37:01.000Z', prompt: 'An empty state with a fox illustration.', sourceFile: 'C:\\work\\fox.png' },
+    { id: 'p5', file: 'C:\\Users\\Yangtao\\Pictures\\image2\\image2-20261025-213540-j1k2l3.png', mediaType: 'image/webp', bytes: 17682, size: '384x384', kind: 'generate', createdAt: '2026-10-25T21:35:40.000Z', prompt: 'The fox mascot on transparency.' },
+    { id: 'p6', file: 'C:\\Users\\Yangtao\\Pictures\\image2\\image2-20261025-213422-m4n5o6.png', mediaType: 'image/png', bytes: 1221239, size: '1672x940', kind: 'generate', createdAt: '2026-10-25T21:34:22.000Z', prompt: 'A wide hero picture of the studio.' },
+  ]
+
+  const realFetch = window.fetch.bind(window)
+  const reply = value => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } })
+  window.fetch = async path => {
+    const url = new URL(path, location.href)
+    if (url.pathname === '/api/image2/settings') return reply({ ok: true, value: SETTINGS })
+    if (url.pathname === '/api/image2/history') return reply({ ok: true, value: { items: HISTORY } })
+    if (url.pathname === '/api/image2/asset') {
+      const file = ASSETS[url.searchParams.get('id')] ?? 'comp.png'
+      return realFetch(new URL(file, location.href))
+    }
+    if (url.pathname === '/api/image2/history/delete') {
+      return reply({ ok: true, value: { items: HISTORY } })
+    }
+    if (url.pathname === '/api/image2/generate') {
+      await new Promise(resolve => setTimeout(resolve, 80))
+      return reply({ ok: true, value: { item: HISTORY[0], items: HISTORY } })
+    }
+    return reply({ ok: false, code: 'internal-error', error: 'preview stub: ' + path })
+  }
+</script>
+<script src="../client.js"></script>
+<script>
+  const registered = {}
+  const locale = {
+    register(namespace, entries) { dictionaries[namespace] = entries; return () => {} },
+    bind(namespace) {
+      return key => {
+        const entries = dictionaries[namespace]
+        const table = entries?.[lang] ?? entries?.en ?? {}
+        return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : key
+      }
+    },
+  }
+  const ctx = {
+    effect: fn => fn(),
+    locale,
+    slots: {
+      inject: (_name, callback) => callback(),
+      register: (options, component) => {
+        registered[options.name + '|' + (options.key ?? options.id)] = component
+        return () => {}
+      },
+    },
+  }
+  window.__client.apply(ctx)
+  const Page = registered['main|image2']
+  if (Page === undefined) {
+    document.getElementById('root').textContent = 'preview: the main panel was not registered'
+  } else {
+    ReactDOM.createRoot(document.getElementById('root'))
+      .render(React.createElement(Page, { t: locale.bind('image2.studio') }))
+  }
+</script>
+</body>
+</html>

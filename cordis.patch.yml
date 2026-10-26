@@ -1,0 +1,11 @@
+# Patch layer for @local/dsh-plugin-image2, declared by `dsh.bundle.patch` and
+# applied when a profile lists this bundle in `dsh.profile.bundles`.
+#
+# One row is the whole plugin. The row's package declares `dsh.client`, so the
+# modules node half also registers this package's `./client` export under the
+# same name: the inserted row mounts the Host routes (settings + generate) and
+# the sidebar page together. The row is inserted rather than id-targeted
+# because no existing row can be re-pointed at another package.
+- insert:
+    - id: image2
+      name: '@local/dsh-plugin-image2'

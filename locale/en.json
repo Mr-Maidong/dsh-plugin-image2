@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Image studio",
+    "description": "Connect an image-generation endpoint with an API key, then generate pictures from a prompt inside Harness."
+  }
+}

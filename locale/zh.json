@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "图像生成",
+    "description": "填写生图接口地址与 API Key，即可在 Harness 中根据提示词生成图片。"
+  }
+}
