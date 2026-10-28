@@ -125,6 +125,8 @@ Host 半侧在启动时加载，装好需要重启 DSH；之后只改 `client.js
 
 - 只用 Harness 自己的设计变量（`--dsw-alias-*`）和 `ui-primitives` 的 `Button` / `Menu` / `ImageLightbox`，
   深浅两套主题都跟随应用。
+- **不自带字体**：全文只用 DSH 的主字体（`--dsw-font-family`），插件里没有任何 font-family 字体栈——
+  连诊断用的等宽行 `.i2-detail` 也是主字体，不引入 `ui-monospace` / `SFMono-Regular` / `Menlo`。
 - **图片预览直接复用宿主能力**：`@deepseek-ai/dsh-client-ui-primitives` 在 shell 的共享模块表里
   （`seed.ts` 把整个命名空间发给每个 fetch bundle），所以 `client.js` 里 `require` 到的 `ImageLightbox`
   就是会话图片附件和 Markdown 正文图片用的那一个弹层：portal 到 `body`、Esc / 点遮罩 / 关闭按钮都能关、

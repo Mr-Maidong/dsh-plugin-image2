@@ -31,7 +31,9 @@
     color-scheme: light;
   }
   html, body { height: 100%; margin: 0; }
-  body { font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Microsoft YaHei UI", sans-serif; }
+  /* No font of its own: the shell's main font, with this stack only as a stand-in
+     when the harness runs outside Harness (the token is undefined there). */
+  body { font-family: var(--dsw-font-family, "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Microsoft YaHei UI", sans-serif); }
   #root { height: 100%; }
 
   /* stand-in for the Harness Button primitive: same variants, sizes and radii */

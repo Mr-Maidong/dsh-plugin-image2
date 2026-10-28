@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-plugin-image2",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "private": true,
   "description": "Image studio: save an image-API endpoint and key for this profile, then generate pictures from a prompt in the Web UI — with optional reference pictures that turn a run into an image-to-image edit — or from the image2_generate tool.",
   "license": "MIT",
