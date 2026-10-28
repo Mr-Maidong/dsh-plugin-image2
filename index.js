@@ -11,7 +11,11 @@
  *   a user can tell a bad key from a bad URL before spending a generation.
  * - `POST /api/image2/generate` posts one prompt to `/images/generations`, saves
  *   the returned image under the output directory, and answers with the new
- *   history entry plus the whole list.
+ *   history entry plus the whole list. The same route takes `multipart/form-data`
+ *   with up to five `reference` pictures and then posts those to `/images/edits`
+ *   instead, which is how the page's prompt box edits instead of generating: the
+ *   pictures travel as base64 data URLs in a JSON body, the only spelling the
+ *   gateways for this model family read. See {@link EDIT_BODIES}.
  * - `GET /api/image2/history` lists the saved pictures, newest first.
  * - `POST /api/image2/history/delete` forgets the entries it is given; the
  *   files on disk stay where the user put them.
@@ -42,6 +46,7 @@ export const inject = ['connection']
 const SETTINGS_ROUTE = '/api/image2/settings'
 const TEST_ROUTE = '/api/image2/test'
 const GENERATE_ROUTE = '/api/image2/generate'
+const CANCEL_ROUTE = '/api/image2/cancel'
 const HISTORY_ROUTE = '/api/image2/history'
 const HISTORY_DELETE_ROUTE = '/api/image2/history/delete'
 const ASSET_ROUTE = '/api/image2/asset'
@@ -58,11 +63,15 @@ const SIZES = ['1:1', '5:4', '4:3', '3:2', '16:9', '21:9', '4:5', '3:4', '2:3', 
 /** Render qualities the endpoint accepts as `quality`. */
 const QUALITIES = ['low', 'medium', 'high', 'auto']
 
-/** Image generation is slow; abort rather than leave a turn hanging forever. */
-const GENERATE_TIMEOUT_MS = 180_000
-
 /** A reachability probe should fail fast. */
 const PROBE_TIMEOUT_MS = 20_000
+
+/** Seconds one generation, edit, or result download may take before it is abandoned. */
+const DEFAULT_TIMEOUT_SECONDS = 180
+
+/** Shortest and longest timeout the settings form accepts, in seconds. */
+const MIN_TIMEOUT_SECONDS = 5
+const MAX_TIMEOUT_SECONDS = 900
 
 /** Default endpoint from the gpt-image2 skill's own default base URL. */
 const DEFAULT_BASE_URL = 'https://image.codesonline.dev/v1'
@@ -81,6 +90,64 @@ const DEFAULT_BACKGROUND = 'auto'
 
 /** Backgrounds the endpoint accepts: `transparent` for cut-out art, `opaque` to flatten it. */
 const BACKGROUNDS = ['auto', 'transparent', 'opaque']
+
+/** Reference pictures one page request may carry; above this it is an edit, not a hint. */
+const MAX_REFERENCES = 5
+
+/**
+ * Largest single reference picture accepted, in bytes.
+ *
+ * The JSON body carries a picture as a base64 data URL, which inflates it by a
+ * third, and the gateways for this model family cap a data URL at 20,971,520
+ * characters — 14 MiB of bytes encodes to 19.6M characters, so this keeps every
+ * accepted picture inside that cap instead of failing after a long upload.
+ */
+const MAX_REFERENCE_BYTES = 14 * 1024 * 1024
+
+/**
+ * Body spellings `/images/edits` is documented with, best first.
+ *
+ * Only the first is JSON: every gateway for this model family reads a JSON body,
+ * and the one this plugin was built against rejects anything else outright, so
+ * the multipart spellings are kept last for plain OpenAI-compatible endpoints.
+ * A spelling is only remembered once it has answered, so a page that works keeps
+ * working without re-probing on every picture.
+ */
+const EDIT_BODIES = ['images', 'image', 'multipart-image', 'multipart-image[]']
+
+/**
+ * Refusals that mean "I could not read this body" rather than "no".
+ *
+ * These are the only ones worth another spelling, and the only ones safe to
+ * retry: an endpoint rejects a body it cannot parse before it generates
+ * anything, while a refusal that names the request itself must never be sent
+ * twice, because the first one may already have produced a picture.
+ */
+const BODY_COMPLAINT_STATUS = new Set([400, 404, 405, 415, 422, 500])
+const BODY_COMPLAINT_PHRASES = [
+  'must be json',
+  'image_url',
+  'image[]',
+  'multipart',
+  'media type',
+  'invalid_request_error',
+  'body',
+  'json',
+  'unexpected',
+  'unrecognized',
+]
+
+/** Which body spelling each endpoint+model last accepted. */
+const acceptedEditBodies = new Map()
+
+/**
+ * Runs that are waiting on the endpoint right now, by the id the page sent with
+ * them. An id is the page's own handle on one click of 生成: while the request is
+ * open, `POST /api/image2/cancel` with that id aborts the upstream call, which is
+ * what actually stops the meter — dropping the browser's own request would leave
+ * the picture generating and the credits spent.
+ */
+const inflightRuns = new Map()
 
 /** One rejected request: `code` is the stable token the page localizes. */
 class RequestError extends Error {
@@ -121,6 +188,7 @@ function defaults() {
     quality: DEFAULT_QUALITY,
     size: DEFAULT_SIZE,
     background: DEFAULT_BACKGROUND,
+    timeoutSeconds: String(DEFAULT_TIMEOUT_SECONDS),
   }
 }
 
@@ -261,6 +329,7 @@ function publicSettings(settings) {
     quality: settings.quality,
     size: settings.size,
     background: settings.background,
+    timeoutSeconds: settings.timeoutSeconds,
     hasApiKey: settings.apiKey !== '',
     apiKeyHint: maskKey(settings.apiKey),
     defaults: defaults(),
@@ -337,6 +406,21 @@ function mediaTypeFromBase64(base64) {
 }
 
 /**
+ * Name the media type of a picture read from disk, for the edit tool: a file on
+ * disk carries no content type the way a form part does, so it is read from the
+ * bytes rather than guessed from the name.
+ * @param bytes - the file's bytes.
+ * @returns the detected media type, defaulting to PNG.
+ */
+function mediaTypeOfBytes(bytes) {
+  if (bytes.length > 3 && bytes[0] === 0x89 && bytes[1] === 0x50) return 'image/png'
+  if (bytes.length > 2 && bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg'
+  if (bytes.length > 11 && bytes.toString('latin1', 0, 4) === 'RIFF'
+    && bytes.toString('latin1', 8, 12) === 'WEBP') return 'image/webp'
+  return 'image/png'
+}
+
+/**
  * Build a collision-free file name for one generated image.
  * @param mediaType - the image's media type, which selects the extension.
  * @returns a file name such as `image2-20260101-120000-a1b2c3.png`.
@@ -380,6 +464,102 @@ function truncate(text, limit) {
 /** @param value - a candidate. @returns the value when it is one of `allowed`. */
 function oneOf(value, allowed) {
   return typeof value === 'string' && allowed.includes(value) ? value : undefined
+}
+
+/**
+ * The timeout to apply to one upstream call.
+ *
+ * The stored value is a string like every other setting, so it is parsed rather
+ * than trusted; a profile saved before this setting existed (or hand-edited to
+ * nonsense) falls back to the default instead of generating without a limit.
+ * @param settings - the effective settings.
+ * @returns the timeout in milliseconds.
+ */
+function timeoutMs(settings) {
+  const seconds = Number.parseInt(settings.timeoutSeconds, 10)
+  if (!Number.isFinite(seconds)) return DEFAULT_TIMEOUT_SECONDS * 1000
+  return Math.min(Math.max(seconds, MIN_TIMEOUT_SECONDS), MAX_TIMEOUT_SECONDS) * 1000
+}
+
+/**
+ * Normalize a user-typed timeout into the stored form.
+ * @param value - the form field, a number or a numeric string.
+ * @returns the clamped value as a string, or undefined for a blank field.
+ * @throws {RequestError} when the text is not a number of seconds.
+ */
+function secondsValue(value) {
+  const text = String(value).trim()
+  if (text === '') return undefined
+  const seconds = Number(text)
+  if (!Number.isFinite(seconds)) {
+    throw new RequestError('invalid-timeout', `The timeout must be a number of seconds, not "${text}".`)
+  }
+  return String(Math.min(Math.max(Math.round(seconds), MIN_TIMEOUT_SECONDS), MAX_TIMEOUT_SECONDS))
+}
+
+/**
+ * The page's id for one run, or an empty string when it sent none.
+ *
+ * Only the shape the page generates is kept: an id is a lookup key in a map
+ * shared by every request, so it is filtered to characters that cannot smuggle
+ * in a collision or a log line.
+ * @param value - the `requestId` field from either body shape.
+ * @returns the sanitized id.
+ */
+function requestIdValue(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{1,64}$/u.test(value.trim()) ? value.trim() : ''
+}
+
+/**
+ * Run one generation or edit with this click's cancel handle, the saved timeout,
+ * and the page's own connection all attached to the upstream calls it makes.
+ *
+ * The three are composed into one signal: the timeout is the user's setting, the
+ * controller is what {@link handleCancel} aborts, and the route's own signal
+ * fires when the page is closed or navigated away from — in every case the
+ * endpoint call is dropped rather than left running.
+ *
+ * @param input.requestId - the page's id for this run, when it sent one.
+ * @param input.signal - the route request's signal, when the bridge supplied one.
+ * @param settings - the effective settings, for the timeout.
+ * @param run - receives the composed signal, this run's cancel handle, and the timeout in seconds.
+ * @returns whatever `run` returns.
+ */
+async function withRunSignals(input, settings, run) {
+  const controller = new AbortController()
+  const entry = { controller, cancelled: false }
+  const id = requestIdValue(input.requestId)
+  if (id !== '') {
+    // A second click from the same page replaces the run it walked away from.
+    inflightRuns.get(id)?.controller.abort()
+    inflightRuns.set(id, entry)
+  }
+  const timeout = timeoutMs(settings)
+  const signals = [AbortSignal.timeout(timeout), controller.signal]
+  if (input.signal instanceof AbortSignal) signals.push(input.signal)
+  try {
+    return await run(AbortSignal.any(signals), entry, timeout / 1000)
+  } finally {
+    if (id !== '' && inflightRuns.get(id) === entry) inflightRuns.delete(id)
+  }
+}
+
+/**
+ * The failure to report when an upstream call did not come back.
+ * @param error - the rejection.
+ * @param entry - this run's cancel handle, when it had one.
+ * @param seconds - the timeout that was in force.
+ * @returns the RequestError to throw.
+ */
+function abortFailure(error, entry, seconds) {
+  if (entry?.cancelled === true) {
+    return new RequestError('cancelled', 'The run was cancelled before the endpoint answered.', 499)
+  }
+  const message = messageOf(error)
+  if (/timeout/iu.test(message)) {
+    return new RequestError('network-error', `No answer within ${seconds} seconds. ${message}`, 504)
+  }
+  return new RequestError('network-error', networkDetail(error), 504)
 }
 
 /**
@@ -435,9 +615,7 @@ async function readJson(request) {
  */
 async function generateImage(input) {
   const settings = await readSettings()
-  const baseUrl = normalizeBaseUrl(settings.baseUrl)
-  if (baseUrl === '') throw new RequestError('missing-endpoint', 'No image API endpoint is configured.')
-  if (settings.apiKey === '') throw new RequestError('missing-key', 'No image API key is saved for this profile.')
+  const { baseUrl } = requireEndpoint(settings)
 
   const payload = {
     model: settings.model === '' ? DEFAULT_MODEL : settings.model,
@@ -450,33 +628,41 @@ async function generateImage(input) {
   const size = input.size ?? (oneOf(settings.size, SIZES) ?? DEFAULT_SIZE)
   if (size !== '') payload.size = size
 
-  let response
-  try {
-    response = await fetch(`${baseUrl}/images/generations`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${settings.apiKey}`, 'content-type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),
-    })
-  } catch (error) {
-    throw new RequestError('network-error', networkDetail(error), 504)
-  }
+  return withRunSignals(input, settings, async (signal, entry, seconds) => {
+    const failed = error => abortFailure(error, entry, seconds)
+    let response
+    try {
+      response = await fetch(`${baseUrl}/images/generations`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${settings.apiKey}`, 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal,
+      })
+    } catch (error) {
+      throw failed(error)
+    }
 
-  return persistImage({
-    ...await readImagePayload(response),
-    prompt: input.prompt,
-    kind: 'generate',
-    outputDirectory: input.outputDir ?? (settings.outputDir === '' ? defaults().outputDir : settings.outputDir),
+    return persistImage({
+      ...await readImagePayload(response, { signal, failure: failed }),
+      prompt: input.prompt,
+      kind: 'generate',
+      outputDirectory: input.outputDir ?? (settings.outputDir === '' ? defaults().outputDir : settings.outputDir),
+    })
   })
 }
 
 /**
  * Turn one images response into the bytes and metadata both operations save.
  * @param response - the endpoint's answer to `/images/generations` or `/images/edits`.
+ * @param options.signal - the composed cancel/timeout signal for the download this may need.
+ * @param options.failure - builds the error for a download that did not complete.
  * @returns the base64 payload and the endpoint's own metadata.
  * @throws {RequestError} when the endpoint refused or answered without an image.
  */
-async function readImagePayload(response) {
+async function readImagePayload(response, options = {}) {
+  const failure = typeof options.failure === 'function'
+    ? options.failure
+    : error => new RequestError('network-error', networkDetail(error), 504)
   if (!response.ok) {
     const detail = await response.text().catch(() => '')
     throw new RequestError('upstream-error', `API ${response.status}: ${truncate(detail, 500)}`, 502)
@@ -502,9 +688,11 @@ async function readImagePayload(response) {
     }
     let download
     try {
-      download = await fetch(first.url, { signal: AbortSignal.timeout(GENERATE_TIMEOUT_MS) })
+      download = await fetch(first.url, {
+        signal: options.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_SECONDS * 1000),
+      })
     } catch (error) {
-      throw new RequestError('network-error', networkDetail(error), 504)
+      throw failure(error)
     }
     if (!download.ok) {
       throw new RequestError('upstream-error', `Downloading the generated image failed with status ${download.status}.`, 502)
@@ -579,48 +767,289 @@ async function persistImage(input) {
  */
 async function editImage(input) {
   const settings = await readSettings()
-  const baseUrl = normalizeBaseUrl(settings.baseUrl)
-  if (baseUrl === '') throw new RequestError('missing-endpoint', 'No image API endpoint is configured.')
-  if (settings.apiKey === '') throw new RequestError('missing-key', 'No image API key is saved for this profile.')
+  const { baseUrl } = requireEndpoint(settings)
 
   const imagePath = localPath(input.imagePath, input.baseDir)
   const imageBytes = await readLocalImage(imagePath, 'image')
+  const images = [{ bytes: imageBytes, mediaType: mediaTypeOfBytes(imageBytes), name: basename(imagePath) }]
+  assertEditableSize(images[0], 'image')
 
-  const form = new FormData()
-  form.append('model', settings.model === '' ? DEFAULT_MODEL : settings.model)
-  form.append('prompt', input.prompt)
-  form.append('n', '1')
-  form.append('quality', input.quality ?? (oneOf(settings.quality, QUALITIES) ?? DEFAULT_QUALITY))
-  form.append('background', input.background ?? (oneOf(settings.background, BACKGROUNDS) ?? DEFAULT_BACKGROUND))
-  form.append('output_format', 'png')
-  if (typeof input.size === 'string' && input.size !== '') form.append('size', input.size)
-  form.append('image', new Blob([imageBytes], { type: mediaTypeOf(imagePath) }), basename(imagePath))
-
+  let mask
   if (typeof input.maskPath === 'string' && input.maskPath.trim() !== '') {
     const maskPath = localPath(input.maskPath, input.baseDir)
     const maskBytes = await readLocalImage(maskPath, 'mask')
-    form.append('mask', new Blob([maskBytes], { type: mediaTypeOf(maskPath) }), basename(maskPath))
+    mask = { bytes: maskBytes, mediaType: mediaTypeOfBytes(maskBytes), name: basename(maskPath) }
+    assertEditableSize(mask, 'mask')
   }
 
-  let response
-  try {
-    response = await fetch(`${baseUrl}/images/edits`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${settings.apiKey}` },
-      body: form,
-      signal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),
-    })
-  } catch (error) {
-    throw new RequestError('network-error', networkDetail(error), 504)
-  }
+  const payload = await withRunSignals(input, settings, async (signal, entry, seconds) => postEdit({
+    baseUrl,
+    apiKey: settings.apiKey,
+    settings,
+    prompt: input.prompt,
+    images,
+    mask,
+    options: input,
+    signal,
+    failure: error => abortFailure(error, entry, seconds),
+  }))
 
   return persistImage({
-    ...await readImagePayload(response),
+    ...payload,
     prompt: input.prompt,
     kind: 'edit',
     sourceFile: imagePath,
     outputDirectory: input.outputDir ?? (settings.outputDir === '' ? defaults().outputDir : settings.outputDir),
   })
+}
+
+/**
+ * Edit the pictures the page uploaded: post them with the prompt to
+ * `/images/edits` and save the answer.
+ *
+ * These pictures exist only in the request, so nothing about them is written to
+ * disk on the way in; only the endpoint's result is saved, as a normal `edit`
+ * entry with no `sourceFile` to point at.
+ *
+ * @param input.images - the reference pictures, in upload order.
+ * @param input.prompt - the instruction describing the change.
+ * @param input.size - an optional aspect ratio for the result.
+ * @param input.quality - an optional quality for the result.
+ * @param input.background - an optional background for the result.
+ * @returns the new gallery entry and the gallery after the insert.
+ * @throws {RequestError} for every refusal or upstream failure.
+ */
+async function editUploadedImages(input) {
+  const settings = await readSettings()
+  const { baseUrl } = requireEndpoint(settings)
+
+  const payload = await withRunSignals(input, settings, async (signal, entry, seconds) => postEdit({
+    baseUrl,
+    apiKey: settings.apiKey,
+    settings,
+    prompt: input.prompt,
+    images: input.images,
+    mask: null,
+    options: input,
+    signal,
+    failure: error => abortFailure(error, entry, seconds),
+  }))
+
+  return persistImage({
+    ...payload,
+    prompt: input.prompt,
+    kind: 'edit',
+    outputDirectory: input.outputDir ?? (settings.outputDir === '' ? defaults().outputDir : settings.outputDir),
+  })
+}
+
+/**
+ * Read the endpoint and key every image call needs, refusing early when either
+ * is missing.
+ * @param settings - the saved settings.
+ * @returns the normalized base URL and the key.
+ * @throws {RequestError} when the endpoint or the key is absent.
+ */
+function requireEndpoint(settings) {
+  const baseUrl = normalizeBaseUrl(settings.baseUrl)
+  if (baseUrl === '') throw new RequestError('missing-endpoint', 'No image API endpoint is configured.')
+  if (settings.apiKey === '') throw new RequestError('missing-key', 'No image API key is saved for this profile.')
+  return { baseUrl, apiKey: settings.apiKey }
+}
+
+/**
+ * The scalar fields every spelling of an edit carries.
+ * @param input.settings - the saved settings supplying model, quality and background defaults.
+ * @param input.prompt - the instruction describing the change.
+ * @param input.options - the caller's overrides for size, quality and background.
+ * @returns the fields, ready to be sent as JSON or as form parts.
+ */
+function editFields(input) {
+  const { settings } = input
+  const fields = {
+    model: settings.model === '' ? DEFAULT_MODEL : settings.model,
+    prompt: input.prompt,
+    n: 1,
+    quality: input.options.quality ?? (oneOf(settings.quality, QUALITIES) ?? DEFAULT_QUALITY),
+    background: input.options.background ?? (oneOf(settings.background, BACKGROUNDS) ?? DEFAULT_BACKGROUND),
+    output_format: 'png',
+  }
+  if (typeof input.options.size === 'string' && input.options.size !== '') fields.size = input.options.size
+  return fields
+}
+
+/**
+ * One picture as the JSON bodies carry it: a data URL, so the bytes ride inside
+ * the body and need no separate upload.
+ * @param image - the picture's bytes and media type.
+ * @returns the data URL.
+ */
+function dataUrl(image) {
+  return `data:${image.mediaType};base64,${image.bytes.toString('base64')}`
+}
+
+/**
+ * Build one spelling of an edit request.
+ * @param strategy - one of {@link EDIT_BODIES}.
+ * @param input - the same shape {@link editFields} takes, plus the pictures.
+ * @returns the body to post and the content type to post it as, or null for
+ * multipart, whose content type `fetch` has to set itself with its boundary.
+ */
+function editBody(strategy, input) {
+  if (strategy.startsWith('multipart')) {
+    return {
+      body: editForm({ ...input, field: strategy === 'multipart-image' ? 'image' : 'image[]' }),
+      contentType: null,
+    }
+  }
+
+  const fields = editFields(input)
+  const urls = input.images.map(dataUrl)
+  if (strategy === 'images') {
+    fields.images = urls.map(image_url => ({ image_url }))
+    if (input.mask !== undefined && input.mask !== null) fields.mask = { image_url: dataUrl(input.mask) }
+  } else {
+    fields.image = urls.length === 1 ? urls[0] : urls
+    if (input.mask !== undefined && input.mask !== null) fields.mask = dataUrl(input.mask)
+  }
+  return { body: JSON.stringify(fields), contentType: 'application/json' }
+}
+
+/**
+ * Build the multipart body an OpenAI-compatible `/images/edits` expects.
+ * @param input - the same shape {@link editFields} takes, plus the pictures.
+ * @param input.field - the multipart name the pictures are carried under.
+ * @param input.mask - an optional mask part marking the editable region.
+ * @returns the form, ready to post.
+ */
+function editForm(input) {
+  const form = new FormData()
+  for (const [name, value] of Object.entries(editFields(input))) form.append(name, String(value))
+  for (const image of input.images) {
+    form.append(input.field, new Blob([image.bytes], { type: image.mediaType }), image.name)
+  }
+  if (input.mask !== undefined && input.mask !== null) {
+    form.append('mask', new Blob([input.mask.bytes], { type: input.mask.mediaType }), input.mask.name)
+  }
+  return form
+}
+
+/**
+ * Post one prepared edit body, turning a transport failure into the code the
+ * page localizes.
+ * @param input.baseUrl - the normalized endpoint.
+ * @param input.apiKey - the key to authenticate with.
+ * @param input.body - the prepared body.
+ * @param input.contentType - the content type, or null to let `fetch` shape it.
+ * @returns the raw upstream response, successful or not.
+ * @throws {RequestError} when the endpoint could not be reached.
+ */
+async function postEdits(input) {
+  const headers = { authorization: `Bearer ${input.apiKey}` }
+  if (input.contentType !== null) headers['content-type'] = input.contentType
+  try {
+    return await fetch(`${input.baseUrl}/images/edits`, {
+      method: 'POST',
+      headers,
+      body: input.body,
+      signal: input.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_SECONDS * 1000),
+    })
+  } catch (error) {
+    if (typeof input.failure === 'function') throw input.failure(error)
+    throw new RequestError('network-error', networkDetail(error), 504)
+  }
+}
+
+/**
+ * Does this refusal look like the endpoint could not read the body we sent?
+ * @param status - the response status.
+ * @param text - the response body.
+ * @returns true when another spelling is worth one more call.
+ */
+function bodyComplaint(status, text) {
+  if (!BODY_COMPLAINT_STATUS.has(status)) return false
+  const lower = text.toLowerCase()
+  return BODY_COMPLAINT_PHRASES.some(phrase => lower.includes(phrase))
+}
+
+/**
+ * Edit pictures: post them with the prompt to `/images/edits` and read the
+ * answer, trying the body spellings this route is documented with until one is
+ * read. Once a spelling answers it is tried first from then on, so a working
+ * endpoint pays the probing cost exactly once.
+ * @param input.baseUrl - the normalized endpoint.
+ * @param input.apiKey - the key to authenticate with.
+ * @param input.settings - the saved settings supplying model, quality and background.
+ * @param input.prompt - the instruction describing the change.
+ * @param input.images - the pictures to edit, in order.
+ * @param input.mask - an optional mask marking the editable region.
+ * @param input.options - the caller's overrides for size, quality and background.
+ * @returns the base64 payload and the endpoint's own metadata.
+ * @throws {RequestError} when every spelling failed, or the endpoint could not be reached.
+ */
+async function postEdit(input) {
+  const memoryKey = `${input.baseUrl}\n${input.settings.model}`
+  const accepted = acceptedEditBodies.get(memoryKey)
+  const order = accepted === undefined
+    ? EDIT_BODIES
+    : [accepted, ...EDIT_BODIES.filter(strategy => strategy !== accepted)]
+
+  let lastStatus = 0
+  let lastText = ''
+  const attempts = []
+  for (const strategy of order) {
+    const { body, contentType } = editBody(strategy, input)
+    const response = await postEdits({
+      baseUrl: input.baseUrl,
+      apiKey: input.apiKey,
+      body,
+      contentType,
+      signal: input.signal,
+      failure: input.failure,
+    })
+    if (response.ok) {
+      acceptedEditBodies.set(memoryKey, strategy)
+      return readImagePayload(response, { signal: input.signal, failure: input.failure })
+    }
+    lastStatus = response.status
+    lastText = await response.text().catch(() => '')
+    attempts.push({ strategy, status: lastStatus })
+    if (!bodyComplaint(lastStatus, lastText)) break
+  }
+
+  // One attempt that failed on its own merits reads exactly like a plain
+  // upstream refusal. A run that walked the spellings says so, and names what
+  // each one was told — which is the difference between "the endpoint said no"
+  // and "this build never tried the body the endpoint wanted".
+  if (attempts.length === 1) {
+    return readImagePayload(new Response(lastText, {
+      status: lastStatus,
+      headers: { 'content-type': 'text/plain' },
+    }))
+  }
+  const tried = attempts.map(attempt => `${attempt.strategy}=${attempt.status}`).join(' ')
+  throw new RequestError(
+    'upstream-error',
+    `API ${lastStatus}: ${truncate(lastText, 400)} [body spellings tried: ${tried}]`,
+    502,
+  )
+}
+
+/**
+ * Refuse a picture the endpoint's body cap cannot carry, before spending an
+ * upload on it. The reference route checks its own uploads on the way in; this
+ * covers the edit tool, whose pictures are read from disk.
+ * @param image - the picture's bytes.
+ * @param role - the argument name, so the message says which one was too big.
+ * @throws {RequestError} when the picture is larger than the cap.
+ */
+function assertEditableSize(image, role) {
+  if (image.bytes.length <= MAX_REFERENCE_BYTES) return
+  const megabytes = (MAX_REFERENCE_BYTES / (1024 * 1024)).toFixed(0)
+  throw new RequestError(
+    'reference-too-large',
+    `The ${role} is ${(image.bytes.length / (1024 * 1024)).toFixed(1)} MB; one picture may be at most ${megabytes} MB.`,
+  )
 }
 
 /**
@@ -668,6 +1097,9 @@ async function handleSettings(request) {
   if (body.quality !== undefined) next.quality = oneOf(body.quality, QUALITIES) ?? next.quality
   if (body.size !== undefined) next.size = oneOf(body.size, SIZES) ?? next.size
   if (body.background !== undefined) next.background = oneOf(body.background, BACKGROUNDS) ?? next.background
+  if (body.timeoutSeconds !== undefined) {
+    next.timeoutSeconds = secondsValue(body.timeoutSeconds) ?? next.timeoutSeconds
+  }
   if (body.clearApiKey === true) next.apiKey = ''
   if (body.apiKey !== undefined) {
     const apiKey = apiKeyValue(body.apiKey)
@@ -715,21 +1147,119 @@ async function handleTest(request) {
 }
 
 /**
+ * Read a `multipart/form-data` body, tolerating an empty one.
+ *
+ * The scalar fields are pulled out by name because a `FormData` exposes them
+ * only through `get`, while the reference pictures are collected separately —
+ * they are the reason this route has a multipart form at all.
+ *
+ * @param request - the incoming request.
+ * @returns the scalar fields and the reference pictures, in the order they were sent.
+ * @throws {RequestError} when the body is not valid multipart, or a part is not
+ * an acceptable picture.
+ */
+async function readForm(request) {
+  let form
+  try {
+    form = await request.formData()
+  } catch {
+    throw new RequestError('invalid-request', 'The multipart body could not be parsed.')
+  }
+  const fields = {}
+  for (const name of ['prompt', 'size', 'quality', 'background', 'requestId']) {
+    const value = form.get(name)
+    if (typeof value === 'string') fields[name] = value
+  }
+  return { fields, references: await readReferences(form) }
+}
+
+/**
+ * Collect the reference pictures of a multipart generate request.
+ *
+ * The page sends them as repeated `reference` parts. An empty part is the
+ * browser's own "no file chosen" case and is skipped; anything that is not an
+ * image, or that is larger than {@link MAX_REFERENCE_BYTES}, is refused rather
+ * than passed upstream.
+ *
+ * @param form - the parsed multipart body.
+ * @returns the pictures, in the order they were sent.
+ * @throws {RequestError} when a part is not an acceptable picture, or when more
+ * than {@link MAX_REFERENCES} were sent.
+ */
+async function readReferences(form) {
+  const parts = form.getAll('reference')
+  if (parts.length > MAX_REFERENCES) {
+    throw new RequestError('too-many-references', `At most ${MAX_REFERENCES} reference pictures are accepted.`)
+  }
+  const references = []
+  for (const part of parts) {
+    if (typeof part === 'string') continue
+    if (part.size === 0) continue
+    if (!part.type.startsWith('image/')) {
+      throw new RequestError('invalid-reference', 'Every reference picture must be an image file.')
+    }
+    if (part.size > MAX_REFERENCE_BYTES) {
+      throw new RequestError('reference-too-large', `A reference picture must be at most ${MAX_REFERENCE_BYTES} bytes.`)
+    }
+    references.push({
+      bytes: Buffer.from(await part.arrayBuffer()),
+      mediaType: part.type,
+      name: part.name === '' ? 'reference' : part.name,
+    })
+  }
+  return references
+}
+
+/**
  * `POST /api/image2/generate`.
+ *
+ * Two bodies reach this route: the JSON one the page uses for a plain
+ * generation, and the multipart one it uses once reference pictures are
+ * attached. In the second case the pictures make it an edit, which is a
+ * different endpoint upstream and a different `kind` in the gallery.
+ *
  * @param request - the incoming request.
  * @returns the new entry and the gallery after the insert.
  */
 async function handleGenerate(request) {
-  const body = await readJson(request)
+  const contentType = request.headers.get('content-type') ?? ''
+  const multipart = contentType.toLowerCase().startsWith('multipart/form-data')
+  const parsed = multipart ? await readForm(request) : null
+  const body = parsed === null ? await readJson(request) : parsed.fields
   const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
   if (prompt === '') throw new RequestError('empty-prompt', 'A prompt is required.')
-  const result = await generateImage({
+
+  const shared = {
     prompt,
     size: oneOf(body.size, SIZES),
     quality: oneOf(body.quality, QUALITIES),
     background: oneOf(body.background, BACKGROUNDS),
-  })
-  return reply(result)
+    requestId: body.requestId,
+    signal: request.signal,
+  }
+  const references = parsed === null ? [] : parsed.references
+  return reply(references.length === 0 ? await generateImage(shared) : await editUploadedImages({ ...shared, images: references }))
+}
+
+/**
+ * `POST /api/image2/cancel`: stop the run the page started.
+ *
+ * The page sends the id it minted for the click; aborting here is what drops the
+ * endpoint call itself, so a cancelled run stops costing anything. An id that is
+ * not running — already finished, or from a reloaded page — answers
+ * `{ cancelled: false }` instead of failing, so a late click is not an error.
+ * @param request - the incoming request.
+ * @returns whether a run was actually stopped.
+ */
+async function handleCancel(request) {
+  const body = await readJson(request)
+  const id = requestIdValue(body.requestId)
+  if (id === '') throw new RequestError('invalid-request', '`requestId` must be the id of a running generation.')
+  const entry = inflightRuns.get(id)
+  if (entry === undefined) return reply({ cancelled: false })
+  entry.cancelled = true
+  entry.controller.abort()
+  return reply({ cancelled: true })
 }
 
 /**
@@ -1027,6 +1557,7 @@ export function apply(ctx) {
   route(ctx, SETTINGS_ROUTE, ['GET', 'POST'], handleSettings)
   route(ctx, TEST_ROUTE, ['POST'], handleTest)
   route(ctx, GENERATE_ROUTE, ['POST'], handleGenerate)
+  route(ctx, CANCEL_ROUTE, ['POST'], handleCancel)
   route(ctx, HISTORY_ROUTE, ['GET'], handleHistory)
   route(ctx, HISTORY_DELETE_ROUTE, ['POST'], handleHistoryDelete)
   route(ctx, ASSET_ROUTE, ['GET'], handleAsset)

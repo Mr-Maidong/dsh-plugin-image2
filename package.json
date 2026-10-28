@@ -1,8 +1,8 @@
 {
   "name": "@local/dsh-plugin-image2",
-  "version": "1.5.3",
+  "version": "1.7.0",
   "private": true,
-  "description": "Image studio: save an image-API endpoint and key for this profile, then generate pictures from a prompt in the Web UI or from the image2_generate tool.",
+  "description": "Image studio: save an image-API endpoint and key for this profile, then generate pictures from a prompt in the Web UI — with optional reference pictures that turn a run into an image-to-image edit — or from the image2_generate tool.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -32,7 +32,9 @@
     "README.md"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true,

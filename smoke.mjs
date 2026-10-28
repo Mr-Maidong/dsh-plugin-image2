@@ -24,10 +24,35 @@ const upstream = createServer((request, response) => {
   request.on('data', chunk => { chunks.push(chunk) })
   request.on('end', () => {
     const raw = Buffer.concat(chunks)
-    requests.push({ method: request.method, url: request.url, authorization: request.headers.authorization, raw })
+    requests.push({
+      method: request.method,
+      url: request.url,
+      authorization: request.headers.authorization,
+      contentType: request.headers['content-type'] ?? '',
+      raw,
+    })
     if (request.url === '/v1/models') {
       response.writeHead(200, { 'content-type': 'application/json' })
       response.end(JSON.stringify({ data: [{ id: 'gpt-image-2.5' }] }))
+      return
+    }
+    if (request.url === '/slow/v1/images/generations' || request.url === '/slow/v1/images/edits') {
+      /* An endpoint that takes its time: something for a cancel and a timeout to
+         interrupt. The timer hangs off the *response*'s close, not the request's:
+         Node fires the request side as soon as the body has been read — which is
+         immediately here — so that would drop every answer instead of only the
+         ones whose caller walked away. */
+      const timer = setTimeout(() => {
+        if (response.writableEnded || response.destroyed) return
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({
+          created: 9,
+          data: [{ b64_json: PNG, revised_prompt: 'slow', output_format: 'png' }],
+          size: '1024x1024',
+        }))
+      }, 8000)
+      response.on('close', () => { clearTimeout(timer) })
+      response.on('error', () => { clearTimeout(timer) })
       return
     }
     if (request.url === '/v1/images/generations') {
@@ -41,12 +66,70 @@ const upstream = createServer((request, response) => {
       return
     }
     if (request.url === '/v1/images/edits') {
+      /* This mock plays the gateway this plugin was built against: a JSON body
+         is the only one it reads, and it wants the pictures as
+         `images[].image_url` data URLs. Anything else is refused the way the
+         real one refuses — with a body complaint, which is what makes the
+         route's fallback walk the other spellings instead of giving up. Two
+         `image` parts are a 400 of their own, so the multipart walk is covered
+         too. */
+      const text = raw.toString('utf8')
+      let body = null
+      try {
+        body = JSON.parse(text)
+      } catch {
+        body = null
+      }
+      if (body !== null) {
+        const urls = Array.isArray(body.images) ? body.images : []
+        const shaped = urls.length > 0 && urls.every(entry => typeof entry?.image_url === 'string'
+          && entry.image_url.startsWith('data:image/'))
+        if (!shaped) {
+          response.writeHead(400, { 'content-type': 'application/json' })
+          response.end(JSON.stringify({ error: { message: 'images[].image_url is required' } }))
+          return
+        }
+      } else if ((raw.toString('latin1').match(/name="image"/g) ?? []).length > 1) {
+        response.writeHead(400, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ error: { message: 'use image[] for several pictures' } }))
+        return
+      } else if (request.headers['content-type']?.startsWith('multipart/form-data') !== true) {
+        response.writeHead(400, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ error: { message: 'The request body must be JSON.' } }))
+        return
+      }
       response.writeHead(200, { 'content-type': 'application/json' })
       response.end(JSON.stringify({
         created: 2,
         data: [{ b64_json: PNG, revised_prompt: 'an edited prompt', output_format: 'png' }],
         size: '512x512',
       }))
+      return
+    }
+    if (request.url === '/legacy/v1/images/edits') {
+      /* The other half of the story: a plain OpenAI-compatible endpoint that
+         only reads multipart, and says so in a way the route recognises as a
+         body complaint. It forces the walk to reach its last spelling. */
+      if ((request.headers['content-type'] ?? '').startsWith('multipart/form-data')) {
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({
+          created: 3,
+          data: [{ b64_json: PNG, revised_prompt: 'a legacy edit', output_format: 'png' }],
+          size: '512x512',
+        }))
+        return
+      }
+      response.writeHead(400, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ error: { message: 'Unsupported content type: send multipart/form-data.' } }))
+      return
+    }
+    if (request.url === '/broken/v1/images/edits') {
+      /* A route that refuses every spelling the way the one the user hit did.
+         Nothing about it can be fixed by trying harder, so the point here is the
+         error: it has to name what was tried, otherwise a stale build and a
+         broken endpoint read exactly alike. */
+      response.writeHead(500, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ error: { message: 'The request body must be JSON.' } }))
       return
     }
     response.writeHead(404, { 'content-type': 'text/plain' })
@@ -85,7 +168,7 @@ const ctx = {
 }
 apply(ctx)
 
-check('six routes registered', routes.size === 6, [...routes.keys()].join(','))
+check('seven routes registered', routes.size === 7, [...routes.keys()].join(','))
 check('two tools registered', tools.length === 2, tools.map(tool => tool.name).join(','))
 check('generate tool present', tools.some(tool => tool.name === 'image2_generate'))
 check('edit tool present', tools.some(tool => tool.name === 'image2_edit'))
@@ -107,6 +190,36 @@ const callBinary = async (path) => {
   const response = await route.fetch(new Request(`http://127.0.0.1:63321${path}`))
   const bytes = Buffer.from(await response.arrayBuffer())
   return { status: response.status, type: response.headers.get('content-type'), bytes }
+}
+
+/**
+ * Post one multipart body, the way the page does once reference pictures are
+ * attached.
+ * @param path - route path.
+ * @param form - the form to send.
+ * @returns the status and the parsed envelope.
+ */
+const callForm = async (path, form) => {
+  const route = routes.get(path.split('?')[0])
+  if (route === undefined) throw new Error(`no route ${path}`)
+  const response = await route.fetch(new Request(`http://127.0.0.1:63321${path}`, { method: 'POST', body: form }))
+  return { status: response.status, payload: await response.json() }
+}
+
+/**
+ * Build a reference-bearing generate request.
+ * @param prompt - the prompt field.
+ * @param references - `[bytes, mediaType, name]` triples, in order.
+ * @returns the form.
+ */
+const referenceForm = (prompt, references) => {
+  const form = new FormData()
+  form.append('prompt', prompt)
+  form.append('size', '1:1')
+  for (const [bytes, mediaType, name] of references) {
+    form.append('reference', new Blob([bytes], { type: mediaType }), name)
+  }
+  return form
 }
 
 console.log('settings')
@@ -222,13 +335,15 @@ check('edit writes beside the workspace', edited.file.startsWith(join(workspace,
 check('edit leaves the source alone', (await stat(source)).size > 0)
 
 const editRequest = requests.filter(r => r.url === '/v1/images/edits').at(-1)
-const editBody = editRequest.raw.toString('latin1')
-check('edit posts multipart', String(editRequest.authorization) === 'Bearer sk-secret-1234')
-check('edit sends the prompt', editBody.includes('make it dusk'))
-check('edit sends the image part', editBody.includes('name="image"') && editBody.includes('filename="src.png"'))
-check('edit sends the model', editBody.includes('gpt-image-2.5'))
-check('edit asks for png', editBody.includes('name="output_format"') && editBody.includes('png'))
-check('edit sends background', editBody.includes('name="background"') && editBody.includes('auto'))
+const editPayload = JSON.parse(editRequest.raw.toString('utf8'))
+check('edit posts JSON', String(editRequest.authorization) === 'Bearer sk-secret-1234'
+  && editPayload.prompt === 'make it dusk', JSON.stringify(editPayload).slice(0, 120))
+check('edit carries the picture as a data URL',
+  editPayload.images?.length === 1 && editPayload.images[0].image_url === `data:image/png;base64,${PNG}`,
+  JSON.stringify(editPayload.images).slice(0, 80))
+check('edit sends the model', editPayload.model === 'gpt-image-2.5', String(editPayload.model))
+check('edit asks for png', editPayload.output_format === 'png', String(editPayload.output_format))
+check('edit sends background', editPayload.background === 'auto', String(editPayload.background))
 
 const editListed = await call('/api/image2/history')
 check('edit lands in the gallery', editListed.payload.value.items.some(entry => entry.id !== undefined && entry.kind === 'edit'))
@@ -238,6 +353,161 @@ const missingSource = await editTool.execute({ image: 'nope.png', prompt: 'x' },
 check('missing source fails cleanly',
   missingSource !== null && missingSource.code === 'invalid-request' && missingSource.message.includes('nope.png'),
   String(missingSource?.message))
+
+console.log('references: image to image')
+const pixel = Buffer.from(PNG, 'base64')
+const withReferences = await callForm('/api/image2/generate', referenceForm('combine these two', [
+  [pixel, 'image/png', 'one.png'],
+  [pixel, 'image/png', 'two.png'],
+]))
+check('reference generate 200', withReferences.status === 200, JSON.stringify(withReferences.payload).slice(0, 300))
+check('reference generate is an edit', withReferences.payload.value?.item?.kind === 'edit', String(withReferences.payload.value?.item?.kind))
+check('uploaded edit names no source file', withReferences.payload.value?.item?.sourceFile === undefined)
+check('uploaded edit lands in the gallery', withReferences.payload.value?.items?.[0]?.id === withReferences.payload.value?.item?.id)
+
+const editCalls = requests.filter(entry => entry.url === '/v1/images/edits')
+const acceptedBody = JSON.parse(editCalls.at(-1).raw.toString('utf8'))
+check('references are sent as a JSON body', editCalls.at(-1).contentType.startsWith('application/json'),
+  editCalls.at(-1).contentType)
+check('references ride as images[].image_url data URLs',
+  acceptedBody.images?.length === 2
+  && acceptedBody.images.every(entry => entry.image_url.startsWith('data:image/png;base64,')),
+  JSON.stringify(acceptedBody.images).slice(0, 120))
+check('the JSON body keeps the prompt', acceptedBody.prompt === 'combine these two', String(acceptedBody.prompt))
+check('reference prompt never reaches generations',
+  requests.filter(entry => entry.url === '/v1/images/generations').every(entry => !entry.raw.toString('utf8').includes('combine these two')))
+
+const callsBeforeOne = requests.filter(entry => entry.url === '/v1/images/edits').length
+const oneReference = await callForm('/api/image2/generate', referenceForm('one picture only', [[pixel, 'image/webp', 'only.webp']]))
+check('single reference also edits', oneReference.status === 200 && oneReference.payload.value?.item?.kind === 'edit', JSON.stringify(oneReference.payload).slice(0, 200))
+check('an accepted body is not re-probed',
+  requests.filter(entry => entry.url === '/v1/images/edits').length - callsBeforeOne === 1)
+
+const tooMany = await callForm('/api/image2/generate', referenceForm('too many', [
+  [pixel, 'image/png', 'a.png'], [pixel, 'image/png', 'b.png'], [pixel, 'image/png', 'c.png'],
+  [pixel, 'image/png', 'd.png'], [pixel, 'image/png', 'e.png'], [pixel, 'image/png', 'f.png'],
+]))
+check('six references 400', tooMany.status === 400 && tooMany.payload.code === 'too-many-references', JSON.stringify(tooMany.payload))
+const notAnImage = await callForm('/api/image2/generate', referenceForm('not a picture', [[Buffer.from('hello'), 'text/plain', 'notes.txt']]))
+check('non-image reference 400', notAnImage.status === 400 && notAnImage.payload.code === 'invalid-reference', JSON.stringify(notAnImage.payload))
+const emptyReference = await callForm('/api/image2/generate', referenceForm('nothing attached', [[Buffer.alloc(0), 'image/png', 'empty.png']]))
+check('empty part falls back to plain generation', emptyReference.status === 200 && emptyReference.payload.value?.item?.kind === 'generate', JSON.stringify(emptyReference.payload).slice(0, 200))
+const noPromptForm = await callForm('/api/image2/generate', referenceForm('   ', [[pixel, 'image/png', 'one.png']]))
+check('multipart without a prompt 400', noPromptForm.status === 400 && noPromptForm.payload.code === 'empty-prompt', JSON.stringify(noPromptForm.payload))
+
+console.log('references: a multipart-only endpoint')
+await call('/api/image2/settings', 'POST', { baseUrl: `${origin}/legacy/v1` })
+const legacy = await callForm('/api/image2/generate', referenceForm('legacy edit', [[pixel, 'image/png', 'legacy.png']]))
+check('a multipart-only endpoint still edits',
+  legacy.status === 200 && legacy.payload.value?.item?.kind === 'edit', JSON.stringify(legacy.payload).slice(0, 200))
+const legacyCalls = requests.filter(entry => entry.url === '/legacy/v1/images/edits')
+check('the walk reaches the multipart spelling',
+  legacyCalls.length === 3
+  && legacyCalls.slice(0, 2).every(entry => entry.contentType.startsWith('application/json'))
+  && legacyCalls[2].contentType.startsWith('multipart/form-data'),
+  JSON.stringify(legacyCalls.map(entry => entry.contentType.split(';')[0])))
+check('the multipart attempt keeps the prompt',
+  legacyCalls[2].raw.toString('latin1').includes('legacy edit'))
+const legacyBefore = legacyCalls.length
+const legacyAgain = await callForm('/api/image2/generate', referenceForm('legacy again', [[pixel, 'image/png', 'again.png']]))
+check('the accepted spelling is tried first next time',
+  legacyAgain.status === 200
+  && requests.filter(entry => entry.url === '/legacy/v1/images/edits').length - legacyBefore === 1,
+  String(requests.filter(entry => entry.url === '/legacy/v1/images/edits').length - legacyBefore))
+await call('/api/image2/settings', 'POST', { baseUrl: `${origin}/v1` })
+
+console.log('references: an endpoint that refuses every body')
+await call('/api/image2/settings', 'POST', { baseUrl: `${origin}/broken/v1` })
+const broken = await callForm('/api/image2/generate', referenceForm('never accepted', [[pixel, 'image/png', 'x.png']]))
+const brokenCalls = requests.filter(entry => entry.url === '/broken/v1/images/edits')
+check('every spelling is tried before giving up', brokenCalls.length === 4,
+  JSON.stringify(brokenCalls.map(entry => entry.contentType.split(';')[0])))
+check('the failure still maps to upstream-error',
+  broken.status === 502 && broken.payload.code === 'upstream-error', JSON.stringify(broken.payload).slice(0, 160))
+check('the failure names the spellings it tried',
+  typeof broken.payload.error === 'string'
+  && broken.payload.error.includes('images=500')
+  && broken.payload.error.includes('image=500')
+  && broken.payload.error.includes('multipart-image=500')
+  && broken.payload.error.includes('multipart-image[]=500'),
+  String(broken.payload.error).slice(0, 220))
+await call('/api/image2/settings', 'POST', { baseUrl: `${origin}/v1` })
+
+console.log('timeout setting')
+const timeoutDefault = await call('/api/image2/settings')
+check('timeout defaults to 180', timeoutDefault.payload.value.timeoutSeconds === '180',
+  String(timeoutDefault.payload.value.timeoutSeconds))
+const timeoutSaved = await call('/api/image2/settings', 'POST', { timeoutSeconds: 45 })
+check('timeout saves', timeoutSaved.payload.value.timeoutSeconds === '45',
+  String(timeoutSaved.payload.value.timeoutSeconds))
+const timeoutLow = await call('/api/image2/settings', 'POST', { timeoutSeconds: 1 })
+check('a tiny timeout clamps up to 5', timeoutLow.payload.value.timeoutSeconds === '5',
+  String(timeoutLow.payload.value.timeoutSeconds))
+const timeoutHigh = await call('/api/image2/settings', 'POST', { timeoutSeconds: '9999' })
+check('a huge timeout clamps down to 900', timeoutHigh.payload.value.timeoutSeconds === '900',
+  String(timeoutHigh.payload.value.timeoutSeconds))
+const timeoutBad = await call('/api/image2/settings', 'POST', { timeoutSeconds: 'soon' })
+check('a non-numeric timeout 400', timeoutBad.status === 400 && timeoutBad.payload.code === 'invalid-timeout',
+  JSON.stringify(timeoutBad.payload).slice(0, 140))
+const timeoutDisk = JSON.parse(await readFile(join(profile, 'image2', 'settings.json'), 'utf8'))
+check('the rejected value never reached disk', timeoutDisk.timeoutSeconds === '900', String(timeoutDisk.timeoutSeconds))
+
+console.log('cancel and timeout on a slow endpoint')
+await call('/api/image2/settings', 'POST', { baseUrl: `${origin}/slow/v1`, timeoutSeconds: 180 })
+const slowForm = (prompt, id) => {
+  const form = new FormData()
+  form.append('prompt', prompt)
+  form.append('requestId', id)
+  return form
+}
+const beforeRuns = (await call('/api/image2/history')).payload.value.items.length
+const running = callForm('/api/image2/generate', slowForm('slow one', 'run-test-cancel'))
+await new Promise(resolve => setTimeout(resolve, 400))
+const cancelUnknown = await call('/api/image2/cancel', 'POST', { requestId: 'run-not-running' })
+check('cancelling a run that is not open answers false',
+  cancelUnknown.payload.value.cancelled === false, JSON.stringify(cancelUnknown.payload))
+const cancelBad = await call('/api/image2/cancel', 'POST', { requestId: 'not an id' })
+check('a malformed requestId 400', cancelBad.status === 400 && cancelBad.payload.code === 'invalid-request',
+  JSON.stringify(cancelBad.payload).slice(0, 140))
+const cancelOk = await call('/api/image2/cancel', 'POST', { requestId: 'run-test-cancel' })
+check('cancelling the open run answers true', cancelOk.payload.value.cancelled === true,
+  JSON.stringify(cancelOk.payload))
+const stopped = await running
+check('the cancelled run answers cancelled',
+  stopped.status === 499 && stopped.payload.code === 'cancelled', JSON.stringify(stopped.payload).slice(0, 160))
+check('a cancelled run saves nothing',
+  (await call('/api/image2/history')).payload.value.items.length === beforeRuns)
+
+await call('/api/image2/settings', 'POST', { timeoutSeconds: 5 })
+const timeoutStarted = Date.now()
+const timedOut = await callForm('/api/image2/generate', slowForm('slow two', 'run-test-timeout'))
+const timeoutWaited = Date.now() - timeoutStarted
+check('a run past the timeout maps to network-error',
+  timedOut.status === 504 && timedOut.payload.code === 'network-error', JSON.stringify(timedOut.payload).slice(0, 160))
+check('the timeout error names the limit',
+  String(timedOut.payload.error).includes('5 seconds'), String(timedOut.payload.error).slice(0, 140))
+check('the run stopped at the timeout, not at the endpoint', timeoutWaited < 6000, `${timeoutWaited}ms`)
+
+const gone = new AbortController()
+const detached = routes.get('/api/image2/generate').fetch(new Request(
+  'http://127.0.0.1:63321/api/image2/generate',
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'slow three' }),
+    signal: gone.signal,
+  },
+)).then(async response => ({ status: response.status, payload: await response.json() }))
+await new Promise(resolve => setTimeout(resolve, 400))
+const detachedStarted = Date.now()
+gone.abort()
+const dropped = await detached
+check('a page that goes away drops its run',
+  dropped.status === 504 && String(dropped.payload.error).includes('abort'),
+  JSON.stringify(dropped.payload).slice(0, 160))
+check('the run did not wait for the endpoint', Date.now() - detachedStarted < 2000,
+  `${Date.now() - detachedStarted}ms`)
+await call('/api/image2/settings', 'POST', { baseUrl: `${origin}/v1`, timeoutSeconds: 180 })
 
 console.log('error paths')
 const noPrompt = await call('/api/image2/generate', 'POST', { prompt: '   ' })
@@ -265,6 +535,8 @@ check('missing key 400', noKey.status === 400 && noKey.payload.code === 'missing
 const clearedFile = JSON.parse(await readFile(join(profile, 'image2', 'settings.json'), 'utf8'))
 check('cleared key on disk', clearedFile.apiKey === '')
 
+// Idle keep-alive sockets would otherwise hold `close` open until they time out.
+upstream.closeAllConnections()
 upstream.close()
 await rm(profile, { recursive: true, force: true })
 console.log(failures.length === 0 ? '\nALL PASS' : `\n${failures.length} FAILED: ${failures.join(', ')}`)

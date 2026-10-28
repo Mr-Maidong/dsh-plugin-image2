@@ -4,12 +4,15 @@
  * half calls. No secret ever enters this module's state: the page sends a key
  * once and afterwards reads back only `hasApiKey` plus a masked hint.
  *
- * The layout follows the design comp: a brand mark and title, a narrow left
- * column holding the prompt and the image settings, and a wide right column
- * whose top card is the newest picture and whose lower card is the gallery of
- * everything generated so far. The gallery deletes one entry or the picked
- * bunch; the settings live behind the gear at the bottom left, and open by
- * themselves the first time the page has no key to work with.
+ * The page opens on the same first-level frame as the Plugins and automation
+ * pages: one 960px column, a 20px title, and the page's action opposite it.
+ * Below that sits a narrow left column holding the prompt and the image
+ * settings, a wide right column whose card is the newest picture, and a
+ * full-width history card. The history shows one row at a time: the row pages
+ * sideways and the dots under it name and pick the page on screen. The gallery
+ * deletes one entry or the picked bunch; the settings sit behind the gear in
+ * the title row, and open by themselves the first time the page has no key to
+ * work with.
  */
 
 window.__ModuleLoader__.load({
@@ -39,12 +42,21 @@ window.__ModuleLoader__.load({
      * its fallback for a build that ships without it.
      */
     const Menu = primitives.Menu
+    /**
+     * The host's own click-to-enlarge preview — the same dialog the conversation
+     * uses for an attached or inlined picture. It portals itself to the body and
+     * owns Escape, the backdrop, and focus restore, so reusing it is a prop call
+     * rather than a second modal implementation. Maybe-undefined for the same
+     * reason as {@link Menu}: without it, opening a picture is simply inert.
+     */
+    const ImageLightbox = primitives.ImageLightbox
 
     const NS = 'image2.studio'
     const PANEL_ID = 'image2'
     const SETTINGS_PATH = '/api/image2/settings'
     const TEST_PATH = '/api/image2/test'
     const GENERATE_PATH = '/api/image2/generate'
+    const CANCEL_PATH = '/api/image2/cancel'
     const HISTORY_PATH = '/api/image2/history'
     const HISTORY_DELETE_PATH = '/api/image2/history/delete'
     const ASSET_PATH = '/api/image2/asset'
@@ -57,6 +69,20 @@ window.__ModuleLoader__.load({
 
     /** Backgrounds the Host accepts: `auto` lets the endpoint decide. */
     const BACKGROUNDS = ['auto', 'transparent', 'opaque']
+
+    /** Reference pictures the prompt box accepts; the Host enforces the same cap. */
+    const MAX_REFERENCES = 5
+
+    /**
+     * A fresh id for one run, so the Host can find that run again to cancel it.
+     * The cancel route accepts `[A-Za-z0-9_-]`, which is exactly what a UUID is;
+     * the fallback covers a page served without `crypto.randomUUID`.
+     * @returns the id string.
+     */
+    function runId() {
+      if (typeof crypto?.randomUUID === 'function') return crypto.randomUUID()
+      return `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+    }
 
     /** Dictionary keys for the background labels. */
     const BACKGROUND_KEYS = {
@@ -79,10 +105,14 @@ window.__ModuleLoader__.load({
       'invalid-endpoint': 'errorInvalidEndpoint',
       'missing-key': 'errorMissingKey',
       'invalid-request': 'errorInvalidRequest',
+      'too-many-references': 'errorTooManyReferences',
+      'invalid-reference': 'errorInvalidReference',
+      'reference-too-large': 'errorReferenceTooLarge',
       'not-found': 'errorNotFound',
       'upstream-error': 'errorUpstream',
       'network-error': 'errorNetwork',
       'write-error': 'errorWrite',
+      'invalid-timeout': 'errorInvalidTimeout',
       'internal-error': 'errorInternal',
     }
 
@@ -106,6 +136,8 @@ window.__ModuleLoader__.load({
       'apiKeyRemove': 'Remove key',
       'model': 'Model',
       'outputDir': 'Output folder',
+      'timeout': 'Timeout (seconds)',
+      'timeoutHint': '5–900 seconds. A run that goes past it is abandoned.',
       'save': 'Save',
       'saving': 'Saving…',
       'saved': 'Settings saved.',
@@ -114,8 +146,16 @@ window.__ModuleLoader__.load({
       'testOk': 'The endpoint answered and accepted the key.',
       'close': 'Close',
       'sectionPrompt': 'Prompt',
+      'previewOpen': 'Preview the full picture',
+      'lightboxDialog': 'Picture preview',
+      'lightboxClose': 'Close the preview',
       'prompt': 'Prompt',
       'promptPlaceholder': 'You are a small whale who has waited for your owner for a very long time…',
+      'referenceAdd': 'Add reference',
+      'referenceHint': 'Without a reference, the prompt alone generates the picture.',
+      'referenceMode': 'Image to image · {count}/{max}',
+      'referenceRemove': 'Remove this reference',
+      'generateEdit': 'Image to image',
       'sectionImage': 'Image settings',
       'size': 'Shape',
       'quality': 'Quality',
@@ -128,10 +168,13 @@ window.__ModuleLoader__.load({
       'bgTransparent': 'Clear',
       'bgOpaque': 'Solid',
       'generate': 'Generate image',
-      'generating': 'Generating…',
-      'sectionLatest': 'Latest',
+      'cancelGenerate': 'Stop generating',
+      'cancelling': 'Stopping…',
+      'cancelled': 'Generation stopped',
+      'sectionLatest': 'Generated preview',
       'sectionHistory': 'History',
       'historyEmpty': 'Pictures you generate show up here.',
+      'historyPage': 'Page {page} of {total}',
       'selectAll': 'Select all',
       'clearSelection': 'Clear selection',
       'deleteSelected': 'Delete selected',
@@ -147,10 +190,14 @@ window.__ModuleLoader__.load({
       'errorInvalidEndpoint': 'That endpoint is not a valid URL.',
       'errorMissingKey': 'Save an API key first.',
       'errorInvalidRequest': 'The request was rejected.',
+      'errorTooManyReferences': 'At most 5 reference pictures.',
+      'errorInvalidReference': 'A reference picture must be an image file.',
+      'errorReferenceTooLarge': 'A reference picture must be at most 14 MB.',
       'errorNotFound': 'That picture is no longer available.',
       'errorUpstream': 'The endpoint refused the request.',
       'errorNetwork': 'Could not reach the endpoint.',
       'errorWrite': 'The picture was generated but could not be saved.',
+      'errorInvalidTimeout': 'The timeout must be a number of seconds.',
       'errorInternal': 'Something went wrong.',
     }
 
@@ -161,21 +208,31 @@ window.__ModuleLoader__.load({
       'endpoint': '接口地址',
       'apiKey': 'API Key',
       'apiKeyPlaceholder': 'sk-…',
-      'apiKeySaved': '已保存密钥，留空表示保持不变。',
-      'apiKeyMissing': '尚未保存密钥。',
+      'apiKeySaved': '已保存密钥，留空表示保持不变',
+      'apiKeyMissing': '尚未保存密钥',
       'apiKeyRemove': '删除密钥',
       'model': '模型',
       'outputDir': '输出目录',
+      'timeout': '超时时间（秒）',
+      'timeoutHint': '5–900 秒，超时会中断本次生图',
       'save': '保存',
       'saving': '保存中…',
-      'saved': '设置已保存。',
+      'saved': '设置已保存',
       'test': '测试连接',
       'testing': '测试中…',
-      'testOk': '接口可以访问，密钥有效。',
+      'testOk': '接口可以访问，密钥有效',
       'close': '关闭',
       'sectionPrompt': '提示词',
+      'previewOpen': '查看原图',
+      'lightboxDialog': '图片预览',
+      'lightboxClose': '关闭预览',
       'prompt': '提示词',
       'promptPlaceholder': '你是一头小鲸，等待你的主人很久很久了…',
+      'referenceAdd': '添加参考图',
+      'referenceHint': '不加参考图时，按提示词直接生图',
+      'referenceMode': '图生图 · {count}/{max}',
+      'referenceRemove': '移除这张参考图',
+      'generateEdit': '图生图',
       'sectionImage': '图像设置',
       'size': '画幅',
       'quality': '质量',
@@ -188,30 +245,37 @@ window.__ModuleLoader__.load({
       'bgTransparent': '透明',
       'bgOpaque': '不透明',
       'generate': '生成图片',
-      'generating': '生成中…',
-      'sectionLatest': '最新',
+      'cancelGenerate': '取消生图',
+      'cancelling': '正在取消…',
+      'cancelled': '已取消生图',
+      'sectionLatest': '生图预览',
       'sectionHistory': '历史',
-      'historyEmpty': '生成的图片会出现在这里。',
+      'historyEmpty': '生成的图片会出现在这里',
+      'historyPage': '第 {page} 页，共 {total} 页',
       'selectAll': '全选',
       'clearSelection': '取消选择',
       'deleteSelected': '删除所选',
       'deleteAll': '全部删除',
       'deleteTitle': '从历史中删除？',
-      'deleteNote': '只删除历史记录，磁盘上的图片文件会保留。',
+      'deleteNote': '只删除历史记录，磁盘上的图片文件会保留',
       'delete': '删除',
       'cancel': '取消',
       'deleteOne': '从历史移除',
       'selectOne': '选择这张图片',
-      'errorEmptyPrompt': '请先填写提示词。',
-      'errorMissingEndpoint': '请先保存接口地址。',
-      'errorInvalidEndpoint': '接口地址不是合法的 URL。',
-      'errorMissingKey': '请先保存 API Key。',
-      'errorInvalidRequest': '请求被拒绝。',
-      'errorNotFound': '这张图片已不可用。',
-      'errorUpstream': '接口返回了错误。',
-      'errorNetwork': '无法连接接口。',
-      'errorWrite': '图片已生成，但保存失败。',
-      'errorInternal': '出现未知错误。',
+      'errorEmptyPrompt': '请先填写提示词',
+      'errorMissingEndpoint': '请先保存接口地址',
+      'errorInvalidEndpoint': '接口地址不是合法的 URL',
+      'errorMissingKey': '请先保存 API Key',
+      'errorInvalidRequest': '请求被拒绝',
+      'errorTooManyReferences': '最多只能添加 5 张参考图',
+      'errorInvalidReference': '参考图必须是图片文件',
+      'errorReferenceTooLarge': '单张参考图不能超过 14 MB',
+      'errorNotFound': '这张图片已不可用',
+      'errorUpstream': '接口返回了错误',
+      'errorNetwork': '无法连接接口',
+      'errorWrite': '图片已生成，但保存失败',
+      'errorInvalidTimeout': '超时时间必须是一个秒数',
+      'errorInternal': '出现未知错误',
     }
 
     const CSS = `
@@ -222,8 +286,24 @@ window.__ModuleLoader__.load({
   -webkit-font-smoothing:antialiased; }
 .i2-scroll { flex:1; min-height:0; overflow:auto; scrollbar-gutter:stable;
   --dsh-scrollbar-width:9px; --dsh-scrollbar-thumb-border:2px; }
-/* Bottom padding leaves the floating settings entry its corner on the last screen. */
-.i2-content { max-width:1120px; margin:0 auto; padding:24px clamp(20px,3.2vw,44px) 72px; }
+/* The first-level frame the Plugins and automation pages share: one centered
+   960px column with the same clamp(24-48px) inline inset and the same 48px
+   floor below the last card. */
+.i2-content { max-width:960px; margin:0 auto; padding:0 clamp(24px,4vw,48px) 48px; }
+
+/* Title row: the page's own 28px top inset, the macOS window strip above it,
+   and the 24px that separates the title from the first card. */
+.i2-heading { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between;
+  gap:16px; padding-top:28px; margin-bottom:24px; }
+[data-platform='darwin'] .i2-heading { padding-top:calc(28px + var(--dsh-frame-top-clearance, 0px)); }
+/* The 20px/28px/500 first-level title step. */
+.i2-heading h1 { flex:0 1 auto; min-width:0; max-width:100%; margin:0; font-size:20px;
+  line-height:28px; font-weight:500; }
+.i2-headingActions { display:flex; flex:none; align-items:center; gap:16px; white-space:nowrap; }
+/* The toolbar capsule: a 32px box with a 13px label, one step above the
+   primitive's own 28px small button. */
+.i2-headingActions .i2-headerAction { height:32px; padding:0 12px; border-radius:16px;
+  font-size:13px; line-height:20px; }
 
 .i2-grid { display:grid; grid-template-columns:minmax(0,1fr); gap:18px; align-items:stretch; }
 .i2-stack { display:flex; flex-direction:column; gap:18px; min-width:0; }
@@ -237,8 +317,11 @@ window.__ModuleLoader__.load({
 /* Card body that should take whatever height the card was stretched to; the floor
    keeps a stacked (single-column) card from collapsing onto its absolutely placed picture. */
 .i2-fill { position:relative; flex:1; min-height:240px; }
-.i2-cardHead { display:flex; align-items:center; gap:10px; min-height:26px; margin-bottom:16px; }
-.i2-cardHead h2 { margin:0; font-size:13px; line-height:20px; font-weight:500; }
+/* One step above the field labels: the 14/22/500 the harness uses for a card or
+   group heading, so 提示词 / 图像设置 / 最新 / 历史 read as module titles rather
+   than as slightly bolder body text. */
+.i2-cardHead { display:flex; align-items:center; gap:10px; min-height:28px; margin-bottom:16px; }
+.i2-cardHead h2 { margin:0; font-size:14px; line-height:22px; font-weight:500; }
 .i2-cardActions { display:flex; align-items:center; gap:6px; margin-left:auto; }
 .i2-count { display:inline-flex; align-items:center; justify-content:center; min-width:17px; height:17px;
   margin-left:7px; padding:0 5px; border-radius:9px; font-size:11px; font-variant-numeric:tabular-nums;
@@ -263,6 +346,67 @@ window.__ModuleLoader__.load({
 .i2-input:focus-visible, .i2-select:focus-visible, .i2-textarea:focus-visible { outline:none;
   border-color:var(--i2-accent);
   box-shadow:0 0 0 3px color-mix(in srgb, var(--i2-accent) 18%, transparent); }
+
+/* The prompt box is one box: the wrapper owns the border, the focus ring and
+   the fill, the textarea sits inside it borderless, and the reference strip is
+   its bottom-left footer. Keeping the frame on the wrapper is what lets a
+   thumbnail look attached to the input rather than stacked under it. */
+.i2-prompt { display:flex; flex-direction:column; box-sizing:border-box; min-height:150px;
+  border:1px solid var(--dsw-alias-border-l1); border-radius:10px; background:var(--dsw-alias-bg-base);
+  transition:border-color .12s ease, box-shadow .12s ease; }
+.i2-prompt:hover { border-color:var(--dsw-alias-border-l2); }
+.i2-prompt:focus-within { border-color:var(--i2-accent);
+  box-shadow:0 0 0 3px color-mix(in srgb, var(--i2-accent) 18%, transparent); }
+.i2-prompt .i2-textarea { flex:1; min-height:0; border:0; border-radius:0; background:transparent;
+  box-shadow:none; resize:none; }
+.i2-prompt .i2-textarea:hover, .i2-prompt .i2-textarea:focus-visible { border:0; box-shadow:none; }
+
+/* Reference pictures, inside the prompt box's bottom-left corner. Six slots —
+   the dashed picker and up to five previews, each a heavily rounded square that
+   matches the thumbnails' own radius — share the row: every one takes an equal
+   share of the width and grows to at most 40px, so five pictures plus the
+   picker always sit on one line at any column width. */
+.i2-refs { display:flex; flex-wrap:nowrap; align-items:center; gap:8px; padding:0 12px 10px;
+  min-width:0; }
+.i2-refAdd { display:inline-flex; align-items:center; justify-content:center; flex:1 1 0; min-width:0;
+  max-width:40px; aspect-ratio:1; box-sizing:border-box; padding:0;
+  border:1px dashed var(--dsw-alias-border-l2); border-radius:12px; background:transparent;
+  color:var(--dsw-alias-label-secondary); font:inherit; cursor:pointer;
+  transition:border-color .12s ease, color .12s ease, background .12s ease; }
+.i2-refAdd:hover:not(:disabled) { border-color:var(--i2-accent); color:var(--dsw-alias-label-primary);
+  background:color-mix(in srgb, var(--i2-accent) 8%, transparent); }
+.i2-refAdd:disabled { opacity:.45; cursor:default; }
+.i2-refAdd:focus-visible { outline:none; border-color:var(--i2-accent);
+  box-shadow:0 0 0 3px color-mix(in srgb, var(--i2-accent) 18%, transparent); }
+/* The empty state's one-line explainer. It is gone the moment a picture lands,
+   so the row belongs to the pictures as soon as there are any. */
+.i2-refHint { flex:0 1 auto; min-width:0; margin-left:auto; overflow:hidden; white-space:nowrap;
+  text-overflow:ellipsis; font-size:12px; line-height:18px; color:var(--dsw-alias-label-secondary); }
+/* The real file input keeps its place in the tab order and stays out of the layout. */
+.i2-refInput { position:absolute; width:1px; height:1px; margin:-1px; padding:0; border:0;
+  overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
+/* A preview slot carries its own ring so it measures exactly like the dashed
+   picker beside it, whatever the picture inside is. */
+.i2-ref { position:relative; flex:1 1 0; min-width:0; max-width:40px; aspect-ratio:1;
+  box-sizing:border-box; border:1px solid var(--dsw-alias-border-l1); border-radius:12px;
+  background:#000; overflow:hidden; }
+.i2-ref img { display:block; width:100%; height:100%; object-fit:cover; border-radius:12px; }
+/* Removal appears with the pointer, the way a history preview's toolbar does,
+   so five previews stay five clean squares until one is asked about. The badge
+   carries the toolbar control's class for its look, so this placement has to
+   out-specify that rule — otherwise the toolbar's own position: relative wins
+   and the badge lands outside the tile. */
+.i2-ref .i2-refDel { position:absolute; top:3px; right:3px; opacity:0; }
+.i2-ref:hover .i2-refDel, .i2-ref:focus-within .i2-refDel { opacity:1; }
+/* Without a pointer there is nothing to hover with, so the badge stays out. */
+@media (hover: none) { .i2-ref .i2-refDel { opacity:1; } }
+.i2-refDel:focus-visible { outline:none; box-shadow:inset 0 0 0 2px var(--i2-accent); }
+/* The mode badge in the prompt card's header, shaped like the history count:
+   the thumbnails below already show which pictures are attached, this says what
+   they turn the button into. */
+.i2-refMode { display:inline-flex; align-items:center; height:20px; padding:0 8px; border-radius:10px;
+  font-size:11px; line-height:16px; font-variant-numeric:tabular-nums;
+  background:color-mix(in srgb, var(--i2-accent) 18%, transparent); color:var(--i2-accent); }
 
 /* Picker trigger: same box as an input; the list it opens is the host's menu. */
 .i2-pickerWrap { display:block; width:100%; }
@@ -289,6 +433,13 @@ window.__ModuleLoader__.load({
 .i2-ratio .i2-pickerIcon svg, .i2-ratio .i2-pickerChevron svg { width:13px; height:13px; }
 
 .i2-full { width:100%; }
+/* The generate button becomes the stop control while a run is open: same slot
+   and same width, so nothing on the card moves when the run starts or ends. */
+.i2-stop { color:var(--dsw-alias-state-error-primary); border-color:var(--dsw-alias-border-l2); }
+.i2-stop:hover:not(:disabled) { color:var(--dsw-alias-state-error-primary);
+  border-color:var(--dsw-alias-state-error-primary);
+  background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent); }
+.i2-clock { font-variant-numeric:tabular-nums; }
 .i2-notice { display:flex; flex-direction:column; gap:2px; margin-top:12px; font-size:12px; line-height:18px; }
 .i2-notice-ok { color:var(--dsw-alias-state-success-primary); }
 .i2-notice-error { color:var(--dsw-alias-state-error-primary); }
@@ -302,12 +453,33 @@ window.__ModuleLoader__.load({
 @keyframes i2-breathe { 0%, 100% { opacity:.82; transform:scale(1); } 50% { opacity:1; transform:scale(1.035); } }
 @media (prefers-reduced-motion: reduce) { .i2-busy .i2-art { animation:none; } }
 
+/* The picture box is black in both themes: it is the mat the picture lands on,
+   and the sliver still visible while a picture loads must read as a viewer's
+   mat rather than as one more card layer. */
 .i2-latest { position:absolute; inset:0; overflow:hidden; border:1px solid var(--dsw-alias-border-l1);
-  border-radius:14px; background:var(--dsw-alias-bg-layer-2); }
+  border-radius:14px; background:#000; }
+/* cover, not fill: the picture fills the whole box without being stretched
+   out of shape, so an aspect ratio that differs from the card is cropped rather
+   than distorted. */
 .i2-latest img { display:block; width:100%; height:100%; object-fit:cover; }
 
-.i2-gallery { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:10px; }
-@media (min-width:1000px) { .i2-gallery { grid-template-columns:repeat(8, minmax(0, 1fr)); } }
+/* History pager: one row per page inside a fixed viewport; the track slides by
+   whole pages and the dots under it pick one. A page's column count is measured
+   in the page itself, because CSS alone cannot know how many pages a row makes. */
+.i2-gallery { position:relative; overflow:hidden; }
+.i2-galleryTrack { display:flex; transition:transform .24s ease; }
+@media (prefers-reduced-motion: reduce) { .i2-galleryTrack { transition:none; } }
+.i2-galleryPage { flex:0 0 100%; display:grid; gap:10px; min-width:0; }
+/* Dots: an 18px hit box around a 6px mark, centered under the row. */
+.i2-dots { display:flex; align-items:center; justify-content:center; gap:2px; margin-top:10px; }
+.i2-dot { display:flex; align-items:center; justify-content:center; width:18px; height:18px;
+  padding:0; border:0; border-radius:50%; background:transparent; cursor:pointer; }
+.i2-dot::before { content:''; width:6px; height:6px; border-radius:50%;
+  background:var(--dsw-alias-border-l2); transition:background .14s ease, transform .14s ease; }
+.i2-dot:hover::before { background:var(--dsw-alias-label-secondary); }
+.i2-dot[aria-current='true']::before { background:var(--i2-accent); transform:scale(1.25); }
+.i2-dot:focus-visible { outline:none;
+  box-shadow:0 0 0 2px color-mix(in srgb, var(--i2-accent) 40%, transparent); }
 .i2-thumb { position:relative; aspect-ratio:4/3; overflow:hidden; border:1px solid var(--dsw-alias-border-l1);
   border-radius:9px; background:var(--dsw-alias-bg-layer-2); }
 .i2-thumb img { display:block; width:100%; height:100%; object-fit:cover; }
@@ -340,13 +512,17 @@ window.__ModuleLoader__.load({
 .i2-pick svg { opacity:0; transition:opacity .1s ease; }
 .i2-pick[aria-pressed='true'] { background:var(--i2-accent); border-color:transparent; }
 .i2-pick[aria-pressed='true'] svg { opacity:1; }
-.i2-thumbDel { position:relative; z-index:1; display:flex; align-items:center; justify-content:center;
-  width:18px; height:18px; padding:0; border:0; border-radius:5px; color:#fff; cursor:pointer;
-  /* No ring: the fill alone separates it from the scrim. */
-  background:#2a2a2e;
+/* One destructive control, two homes — the history toolbar and a reference
+   picture — so the shape, fill, glyph colour and hover state are declared once
+   and each home only sets its own place and size. No ring: the fill alone
+   separates it from the scrim. */
+.i2-thumbDel, .i2-refDel { display:flex; align-items:center; justify-content:center; padding:0;
+  border:0; border-radius:5px; background:#2a2a2e; color:#fff; cursor:pointer;
   transition:background .12s ease, opacity .12s ease; }
-.i2-thumbDel:hover:not(:disabled) { background:var(--dsw-alias-state-error-primary); }
-.i2-thumbDel:disabled { opacity:.45; cursor:default; }
+.i2-thumbDel:hover:not(:disabled), .i2-refDel:hover:not(:disabled) {
+  background:var(--dsw-alias-state-error-primary); }
+.i2-thumbDel:disabled, .i2-refDel:disabled { opacity:.45; cursor:default; }
+.i2-thumbDel { position:relative; z-index:1; width:18px; height:18px; }
 /* Batch delete: the only destructive control in the card head, tinted to match.
    Borderless, so the label reads as text with an icon rather than a cramped chip. */
 .i2-page .i2-batchDel { border:0; color:var(--dsw-alias-state-error-primary); }
@@ -357,15 +533,14 @@ window.__ModuleLoader__.load({
 .i2-galleryEmpty { margin:0; padding:20px 0 4px; text-align:center; font-size:12px;
   color:var(--dsw-alias-label-secondary); }
 
-/* Floating settings entry: sits in the page's bottom-left corner over the content,
-   tall enough to read as a button rather than a footnote (1.5x the 28px size). */
-.i2-page .i2-float { position:absolute; left:16px; bottom:16px; z-index:20; height:42px; padding:0 16px;
-  gap:8px; font-size:13px; border:1px solid var(--dsw-alias-border-l1); border-radius:12px;
-  background:color-mix(in srgb, var(--dsw-alias-bg-layer-1) 92%, transparent);
-  -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px);
-  box-shadow:0 10px 28px -14px rgba(0,0,0,.7); }
-.i2-page .i2-float:hover { border-color:var(--dsw-alias-border-l2); color:var(--dsw-alias-label-primary);
-  background:var(--dsw-alias-bg-layer-2); }
+/* Click-to-enlarge: every picture in this panel is an opener for the host's own
+   lightbox, so one class carries the whole affordance — fill the frame, show a
+   zoom cursor, and take an inner focus ring, because each of these frames clips
+   its own overflow and would cut an outer one off. */
+.i2-zoom { display:block; width:100%; height:100%; padding:0; border:0; border-radius:inherit;
+  background:transparent; cursor:zoom-in; }
+.i2-zoom:focus-visible { outline:none; box-shadow:inset 0 0 0 2px var(--i2-accent); }
+.i2-zoom:disabled { cursor:default; }
 
 .i2-mask { position:fixed; inset:0; z-index:60; display:flex; align-items:center; justify-content:center;
   padding:24px; background:rgba(8,8,10,.5); }
@@ -439,6 +614,16 @@ window.__ModuleLoader__.load({
       }))
     }
 
+    function IconClock({ size = 16 }) {
+      return glyph(size,
+        h('circle', { cx: 12, cy: 12, r: 8.3 }),
+        h('path', { d: 'M12 7.3v5l3.3 2' }))
+    }
+
+    function IconStop({ size = 16 }) {
+      return glyph(size, h('rect', { x: 7.4, y: 7.4, width: 9.2, height: 9.2, rx: 2.2 }))
+    }
+
     function IconPicture({ size = 16 }) {
       return glyph(size,
         h('rect', { x: 3.2, y: 4.6, width: 17.6, height: 14.8, rx: 2.6 }),
@@ -458,6 +643,15 @@ window.__ModuleLoader__.load({
 
     function IconChevron({ size = 14 }) {
       return glyph(size, h('path', { d: 'm6.5 9.2 5.5 5.4 5.5-5.4' }))
+    }
+
+    /** The reference picker's leading glyph: a picture carrying a plus. */
+    function IconImagePlus({ size = 16 }) {
+      return glyph(size,
+        h('path', { d: 'M20 12.4v4.8a2.4 2.4 0 0 1-2.4 2.4H6.4A2.4 2.4 0 0 1 4 17.2V6.4A2.4 2.4 0 0 1 6.4 4h4.8' }),
+        h('path', { d: 'm4.6 16.6 4-3.7 3 2.8 2.6-2.4 4.4 4' }),
+        h('path', { d: 'M17.6 3.4v6' }),
+        h('path', { d: 'M14.6 6.4h6' }))
     }
 
     function IconSparkle({ size = 16 }) {
@@ -508,26 +702,30 @@ window.__ModuleLoader__.load({
       items: [],
       prompted: false,
       filled: false,
+      /**
+       * The chosen reference pictures, kept across a sidebar page switch the way
+       * the form is: each entry is `{ file, url }` with a live object URL.
+       */
+      refs: [],
       /** Before the settings land: the same shape, quality and background a fresh profile starts with. */
       form: {
         baseUrl: '', apiKey: '', model: '', outputDir: '', prompt: '',
-        size: '16:9', quality: 'auto', background: 'auto',
+        size: '16:9', quality: 'auto', background: 'auto', timeoutSeconds: '180',
       },
     }
 
     /**
-     * One JSON round trip against the Host routes.
+     * One round trip against the Host routes, unwrapped into the envelope's
+     * `value`.
      * @param path - absolute route path.
-     * @param body - omitted for a read; sent as the JSON body otherwise.
+     * @param init - the fetch init for this request.
      * @returns the envelope's `value`.
      * @throws {Error} carrying a stable `code` the page localizes.
      */
-    async function request(path, body) {
+    async function envelope(path, init) {
       let response
       try {
-        response = await fetch(path, body === undefined
-          ? { method: 'GET' }
-          : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+        response = await fetch(path, init)
       } catch (error) {
         const failure = new Error(error instanceof Error ? error.message : String(error))
         failure.code = 'network-error'
@@ -549,6 +747,45 @@ window.__ModuleLoader__.load({
         throw failure
       }
       return payload.value
+    }
+
+    /**
+     * One JSON round trip against the Host routes.
+     * @param path - absolute route path.
+     * @param body - omitted for a read; sent as the JSON body otherwise.
+     * @param signal - optional abort signal, for the calls the page can stop.
+     * @returns the envelope's `value`.
+     * @throws {Error} carrying a stable `code` the page localizes.
+     */
+    async function request(path, body, signal) {
+      return envelope(path, body === undefined
+        ? { method: 'GET', ...(signal === undefined ? {} : { signal }) }
+        : {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+          ...(signal === undefined ? {} : { signal }),
+        })
+    }
+
+    /**
+     * One multipart round trip: the same envelope as {@link request}, with the
+     * chosen reference pictures attached as repeated `reference` parts. Sending
+     * them is what turns a generation into an image-to-image edit.
+     * @param path - absolute route path.
+     * @param fields - the scalar fields the JSON form would have carried.
+     * @param files - the reference pictures, in the order they were picked.
+     * @param signal - optional abort signal, for the calls the page can stop.
+     * @returns the envelope's `value`.
+     * @throws {Error} carrying a stable `code` the page localizes.
+     */
+    async function requestForm(path, fields, files, signal) {
+      const form = new FormData()
+      for (const [name, value] of Object.entries(fields)) {
+        if (value !== undefined && value !== null) form.append(name, String(value))
+      }
+      for (const file of files) form.append('reference', file, file.name)
+      return envelope(path, { method: 'POST', body: form, ...(signal === undefined ? {} : { signal }) })
     }
 
     /**
@@ -783,6 +1020,16 @@ window.__ModuleLoader__.load({
           spellCheck: false,
           onChange: event => { onChange({ outputDir: event.target.value }) },
         }))),
+        field(t('timeout'), control(h(IconClock), h('input', {
+          className: 'i2-input',
+          type: 'number',
+          min: 5,
+          max: 900,
+          step: 5,
+          value: form.timeoutSeconds,
+          onChange: event => { onChange({ timeoutSeconds: event.target.value }) },
+        }))),
+        h('p', { className: 'i2-detail', style: { margin: '-8px 0 16px 2px' } }, t('timeoutHint')),
         h('div', { className: 'i2-dialogFoot' },
           hasKey
             ? h(Button, {
@@ -882,6 +1129,24 @@ window.__ModuleLoader__.load({
       const [picked, setPicked] = useState([])
       /** Ids waiting for the confirmation dialog, or null. */
       const [pending, setPending] = useState(null)
+      /** Seconds the running generation has taken; the button label shows them. */
+      const [elapsed, setElapsed] = useState(0)
+      /** True between asking to stop and the run answering; the button says so. */
+      const [cancelling, setCancelling] = useState(false)
+      /** The run in flight: its Host-side id and this page's own abort handle. */
+      const runRef = useRef(null)
+      /** The history page on screen; clamped to the page count when rendered. */
+      const [page, setPage] = useState(0)
+      /** How many thumbnails one history row carries at the measured width. */
+      const [perPage, setPerPage] = useState(8)
+      /** The history row's viewport, measured to pick `perPage`. */
+      const galleryRef = useRef(null)
+      /** Reference pictures attached to the prompt, newest last. */
+      const [refs, setRefsState] = useState(cache.refs)
+      /** The hidden file input the picker button opens. */
+      const refInput = useRef(null)
+      /** The picture the host lightbox is showing, or null while it is closed. */
+      const [preview, setPreview] = useState(null)
 
       const setForm = next => {
         const merged = { ...form, ...next }
@@ -896,6 +1161,10 @@ window.__ModuleLoader__.load({
         cache.items = value
         setItemsState(value)
       }
+      const setRefs = value => {
+        cache.refs = value
+        setRefsState(value)
+      }
 
       useEffect(() => {
         let cancelled = false
@@ -908,6 +1177,7 @@ window.__ModuleLoader__.load({
               baseUrl: value.baseUrl,
               model: value.model,
               outputDir: value.outputDir,
+              timeoutSeconds: value.timeoutSeconds ?? '180',
               size: value.size ?? '16:9',
               quality: value.quality ?? 'auto',
               background: value.background ?? 'auto',
@@ -928,6 +1198,45 @@ window.__ModuleLoader__.load({
         return () => { cancelled = true }
       }, [])
 
+      /**
+       * The generate button's clock. It starts when the request goes out and is
+       * cleared when the run ends, so the label reads `生成中… 3s` and never
+       * carries a stale second into the next run.
+       */
+      useEffect(() => {
+        if (busy !== 'generate') {
+          setElapsed(0)
+          return undefined
+        }
+        const started = Date.now()
+        setElapsed(0)
+        const timer = setInterval(() => {
+          setElapsed(Math.floor((Date.now() - started) / 1000))
+        }, 1000)
+        return () => { clearInterval(timer) }
+      }, [busy])
+
+      /**
+       * One history row holds as many 4:3 thumbnails as the card can carry at
+       * their 84px floor, capped at the eight-across rhythm the card used before
+       * it became a pager. Re-measured on resize; the row only exists once the
+       * history is non-empty, which is what the dependency re-runs on.
+       */
+      useEffect(() => {
+        const node = galleryRef.current
+        if (node === null) return undefined
+        const gap = 10
+        const measure = () => {
+          const count = Math.floor((node.clientWidth + gap) / (84 + gap))
+          setPerPage(Math.max(2, Math.min(8, count)))
+        }
+        measure()
+        if (typeof ResizeObserver === 'undefined') return undefined
+        const observer = new ResizeObserver(measure)
+        observer.observe(node)
+        return () => { observer.disconnect() }
+      }, [items.length])
+
       const save = async () => {
         const firstRun = settings === null || settings.hasApiKey !== true
         setBusy('save')
@@ -937,10 +1246,11 @@ window.__ModuleLoader__.load({
             baseUrl: form.baseUrl,
             model: form.model,
             outputDir: form.outputDir,
+            timeoutSeconds: form.timeoutSeconds,
             apiKey: form.apiKey,
           })
           setSettings(value)
-          setForm({ apiKey: '' })
+          setForm({ apiKey: '', timeoutSeconds: value.timeoutSeconds ?? form.timeoutSeconds })
           setNotice({ scope: 'settings', tone: 'ok', code: 'saved' })
           if (firstRun && value.hasApiKey === true) setOpenSettings(false)
         } catch (error) {
@@ -978,25 +1288,115 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * Take the files the picker returned. Non-images are dropped, and the
+       * selection is cut off at {@link MAX_REFERENCES} with a notice, so the row
+       * never claims more than the Host would accept.
+       * @param files - the picked files, in picker order.
+       */
+      const addReferences = files => {
+        const images = files.filter(file => file.type.startsWith('image/'))
+        const room = MAX_REFERENCES - refs.length
+        if (images.length === 0) {
+          if (files.length > 0) setNotice({ scope: 'prompt', tone: 'error', code: 'invalid-reference' })
+          return
+        }
+        if (room <= 0 || images.length > room) {
+          setNotice({ scope: 'prompt', tone: 'error', code: 'too-many-references' })
+        }
+        if (room <= 0) return
+        setRefs([
+          ...refs,
+          ...images.slice(0, room).map(file => ({ file, url: URL.createObjectURL(file) })),
+        ])
+      }
+
+      /**
+       * Hand one picture to the host's lightbox. A build that ships without the
+       * primitive leaves the click inert instead of throwing, which is the same
+       * bargain {@link Picker} makes for a missing menu.
+       * @param src - the original picture URL: the asset route's bytes, or a
+       * picked file's object URL.
+       * @param alt - the accessible name, and what the dialog announces.
+       */
+      const openPreview = (src, alt) => {
+        if (typeof ImageLightbox !== 'function') return
+        setPreview({ src, alt })
+      }
+
+      /**
+       * Drop one reference and release its object URL; the same file can then be
+       * picked again and gets a fresh URL.
+       * @param url - the entry's object URL, which is also its identity.
+       */
+      const removeReference = url => {
+        URL.revokeObjectURL(url)
+        setRefs(refs.filter(entry => entry.url !== url))
+      }
+
+      /**
+       * Stop the run in flight.
+       *
+       * The Host is told first, because aborting the endpoint call is what stops
+       * the picture being generated — and billed. Aborting this page's own
+       * request is only the fallback for a Host that did not answer the cancel
+       * (a reloaded page, a dropped route): the bridge then sees the page go away
+       * and drops the run the same way.
+       */
+      const cancel = async () => {
+        const run = runRef.current
+        if (run === null) return
+        setCancelling(true)
+        const fallback = setTimeout(() => { run.controller.abort() }, 3000)
+        try {
+          await request(CANCEL_PATH, { requestId: run.id })
+        } catch {
+          run.controller.abort()
+        } finally {
+          clearTimeout(fallback)
+        }
+      }
+
       const generate = async () => {
         const prompt = form.prompt.trim()
         if (prompt === '') {
           setNotice({ scope: 'prompt', tone: 'error', code: 'empty-prompt' })
           return
         }
+        const controller = new AbortController()
+        const id = runId()
+        runRef.current = { id, controller }
         setBusy('generate')
         setNotice(null)
         try {
-          const value = await request(GENERATE_PATH, {
+          const fields = {
             prompt,
             size: form.size,
             quality: form.quality,
             background: form.background,
-          })
+            requestId: id,
+          }
+          // With references attached the same route takes multipart and edits;
+          // without them it stays the JSON generation it always was.
+          const value = refs.length === 0
+            ? await request(GENERATE_PATH, fields, controller.signal)
+            : await requestForm(GENERATE_PATH, fields, refs.map(entry => entry.file), controller.signal)
           setItems(Array.isArray(value.items) ? value.items : [])
+          setPage(0)
         } catch (error) {
-          setNotice({ scope: 'prompt', tone: 'error', code: error.code ?? 'internal-error', detail: error.message })
+          const code = controller.signal.aborted
+            ? 'cancelled'
+            : (error.code ?? 'internal-error')
+          // A run the user stopped needs no technical detail beside it.
+          setNotice({
+            scope: 'prompt',
+            tone: code === 'cancelled' ? 'ok' : 'error',
+            code,
+            detail: code === 'cancelled' ? '' : error.message,
+          })
         } finally {
+          runRef.current = null
+          setCancelling(false)
           setBusy(null)
         }
       }
@@ -1026,18 +1426,75 @@ window.__ModuleLoader__.load({
       const latest = items.length === 0 ? null : items[0]
       const pickedIds = picked.filter(id => items.some(item => item.id === id))
       const allPicked = items.length > 0 && pickedIds.length === items.length
+      const pageCount = items.length === 0 ? 1 : Math.ceil(items.length / perPage)
+      const currentPage = Math.min(page, pageCount - 1)
+      const pages = []
+      for (let start = 0; start < items.length; start += perPage) {
+        pages.push(items.slice(start, start + perPage))
+      }
       const sizeItems = SIZES.map(value => ({ value, label: value }))
       const qualityItems = QUALITIES.map(value => ({ value, label: t(QUALITY_KEYS[value]) }))
       const backgroundItems = BACKGROUNDS.map(value => ({ value, label: t(BACKGROUND_KEYS[value]) }))
 
-      const promptCard = card(t('sectionPrompt'), null,
-        h('textarea', {
-          className: 'i2-textarea',
-          value: form.prompt,
-          placeholder: t('promptPlaceholder'),
-          'aria-label': t('prompt'),
-          onChange: event => { setForm({ prompt: event.target.value }) },
-        }))
+      /**
+       * The reference row inside the prompt box: the dashed picker at the
+       * bottom-left, one thumbnail per chosen picture, and — while the row is
+       * still empty — a line saying what an empty row will do. The chosen mode
+       * itself rides the card header, so this row never needs a second line.
+       */
+      const referenceRow = h('div', { className: 'i2-refs' },
+        h('button', {
+          type: 'button',
+          className: 'i2-refAdd',
+          disabled: refs.length >= MAX_REFERENCES,
+          'aria-label': t('referenceAdd'),
+          title: t('referenceAdd'),
+          onClick: () => { refInput.current?.click() },
+        },
+        h(IconImagePlus, { size: 15 })),
+        refs.map(entry => h('span', { className: 'i2-ref', key: entry.url },
+          h('button', {
+            type: 'button',
+            className: 'i2-zoom',
+            'aria-label': `${t('previewOpen')}: ${entry.file.name}`,
+            title: entry.file.name,
+            onClick: () => { openPreview(entry.url, entry.file.name) },
+          }, h('img', { src: entry.url, alt: entry.file.name })),
+          h('button', {
+            type: 'button',
+            className: 'i2-thumbDel i2-refDel',
+            'aria-label': `${t('referenceRemove')}: ${entry.file.name}`,
+            title: t('referenceRemove'),
+            onClick: () => { removeReference(entry.url) },
+          }, h(IconTrash, { size: 12 })))),
+        h('input', {
+          ref: refInput,
+          type: 'file',
+          className: 'i2-refInput',
+          accept: 'image/*',
+          multiple: true,
+          tabIndex: -1,
+          'aria-hidden': 'true',
+          onChange: event => {
+            const files = Array.from(event.target.files ?? [])
+            // Clear the input so picking the same file twice still fires a change.
+            event.target.value = ''
+            addReferences(files)
+          },
+        }),
+        refs.length === 0 ? h('span', { className: 'i2-refHint' }, t('referenceHint')) : null)
+
+      const promptCard = card(t('sectionPrompt'),
+        refs.length === 0 ? null : h('span', { className: 'i2-refMode' }, t('referenceMode', { count: refs.length, max: MAX_REFERENCES })),
+        h('div', { className: 'i2-prompt' },
+          h('textarea', {
+            className: 'i2-textarea',
+            value: form.prompt,
+            placeholder: t('promptPlaceholder'),
+            'aria-label': t('prompt'),
+            onChange: event => { setForm({ prompt: event.target.value }) },
+          }),
+          referenceRow))
 
       const imageCard = card(t('sectionImage'), null,
         h('div', { className: 'i2-ratio' },
@@ -1075,14 +1532,25 @@ window.__ModuleLoader__.load({
               onPick: value => { setForm({ background: value }) },
             }))),
         h('div', { style: { marginTop: 'auto', paddingTop: '20px' } },
-          h(Button, {
-            variant: 'primary',
-            size: 'md',
-            className: 'i2-full',
-            icon: h(IconSparkle),
-            disabled: idle,
-            onClick: hasKey ? generate : () => { setOpenSettings(true) },
-          }, busy === 'generate' ? t('generating') : t('generate'))),
+          busy === 'generate'
+            ? h(Button, {
+              variant: 'outline',
+              size: 'md',
+              className: 'i2-full i2-stop',
+              icon: h(IconStop),
+              disabled: cancelling,
+              onClick: cancelling ? undefined : cancel,
+            }, cancelling
+              ? t('cancelling')
+              : h('span', { className: 'i2-clock' }, `${t('cancelGenerate')} ${elapsed}s`))
+            : h(Button, {
+              variant: 'primary',
+              size: 'md',
+              className: 'i2-full',
+              icon: h(IconSparkle),
+              disabled: idle,
+              onClick: hasKey ? generate : () => { setOpenSettings(true) },
+            }, t(refs.length === 0 ? 'generate' : 'generateEdit'))),
         noticeBlock(notice, 'prompt', t))
 
       const latestCard = card(t('sectionLatest'), null,
@@ -1091,7 +1559,13 @@ window.__ModuleLoader__.load({
             h('img', { className: 'i2-art', src: ART_EMPTY, alt: '', 'aria-hidden': 'true' }))
           : h('div', { className: 'i2-fill' },
             h('div', { className: 'i2-latest' },
-              h('img', { src: assetUrl(latest.id), alt: latest.prompt }))))
+              h('button', {
+                type: 'button',
+                className: 'i2-zoom',
+                'aria-label': t('previewOpen'),
+                title: t('previewOpen'),
+                onClick: () => { openPreview(assetUrl(latest.id), latest.prompt) },
+              }, h('img', { src: assetUrl(latest.id), alt: latest.prompt })))))
 
       const historyActions = items.length === 0
         ? null
@@ -1120,6 +1594,9 @@ window.__ModuleLoader__.load({
       /**
        * One gallery tile: the picture, plus the toolbar that slides up from the
        * bottom edge carrying the pick and delete controls.
+       *
+       * The picture itself opens the lightbox; picking belongs to the bar's
+       * checkbox alone, so a look never changes what a delete would take.
        * @param item - the history entry to render.
        * @returns the tile element.
        */
@@ -1128,11 +1605,14 @@ window.__ModuleLoader__.load({
         return h('div', {
           key: item.id,
           className: isPicked ? 'i2-thumb isPicked' : 'i2-thumb',
-          // The whole tile picks; the two controls on the bar stay the real
-          // keyboard-reachable actions inside it.
-          onClick: () => { togglePick(item.id) },
         },
-        h('img', { src: assetUrl(item.id), alt: item.prompt, loading: 'lazy', draggable: false }),
+        h('button', {
+          type: 'button',
+          className: 'i2-zoom',
+          'aria-label': `${t('previewOpen')}: ${item.prompt}`,
+          title: t('previewOpen'),
+          onClick: () => { openPreview(assetUrl(item.id), item.prompt) },
+        }, h('img', { src: assetUrl(item.id), alt: item.prompt, loading: 'lazy', draggable: false })),
         h('div', { className: 'i2-thumbBar' },
           h('button', {
             type: 'button',
@@ -1140,7 +1620,7 @@ window.__ModuleLoader__.load({
             'aria-pressed': isPicked,
             'aria-label': t('selectOne'),
             title: t('selectOne'),
-            onClick: event => { event.stopPropagation(); togglePick(item.id) },
+            onClick: () => { togglePick(item.id) },
           }, h(IconCheck, { size: 10 })),
           h('button', {
             type: 'button',
@@ -1148,33 +1628,62 @@ window.__ModuleLoader__.load({
             title: t('deleteOne'),
             'aria-label': t('deleteOne'),
             disabled: idle,
-            onClick: event => { event.stopPropagation(); setPending([item.id]) },
+            onClick: () => { setPending([item.id]) },
           }, h(IconTrash, { size: 12 }))))
       }
+
+      /**
+       * The dots under the history row: one per page, the current one marked.
+       * A history that fits on one page carries none.
+       */
+      const historyDots = pageCount < 2
+        ? null
+        : h('div', { className: 'i2-dots' },
+          pages.map((_, index) => h('button', {
+            key: index,
+            type: 'button',
+            className: 'i2-dot',
+            'aria-current': index === currentPage ? 'true' : undefined,
+            'aria-label': t('historyPage', { page: index + 1, total: pageCount }),
+            onClick: () => { setPage(index) },
+          })))
 
       const historyCard = card(t('sectionHistory'), historyActions,
         items.length === 0
           ? h('p', { className: 'i2-galleryEmpty' }, t('historyEmpty'))
-          : h('div', { className: 'i2-gallery' }, items.map(thumbTile)),
+          : h('div', { className: 'i2-gallery', ref: galleryRef },
+            h('div', {
+              className: 'i2-galleryTrack',
+              style: { transform: `translateX(-${currentPage * 100}%)` },
+            },
+            pages.map((chunk, index) => h('div', {
+              key: index,
+              className: 'i2-galleryPage',
+              style: { gridTemplateColumns: `repeat(${perPage}, minmax(0, 1fr))` },
+            }, chunk.map(thumbTile)))),
+            historyDots),
         noticeBlock(notice, 'history', t))
 
       return h('div', { className: 'i2-page' },
         h('style', null, CSS),
         h('div', { className: 'i2-scroll' },
           h('div', { className: 'i2-content' },
+            // The first-level title row every other page in the main panel opens
+            // with: the page's name at the left, its one action at the right.
+            h('div', { className: 'i2-heading' },
+              h('h1', null, t('panel')),
+              h('div', { className: 'i2-headingActions' },
+                h(Button, {
+                  variant: 'outline',
+                  size: 'sm',
+                  className: 'i2-headerAction',
+                  icon: h(IconGear, { size: 15 }),
+                  onClick: () => { setOpenSettings(true) },
+                }, t('settingsOpen')))),
             h('div', { className: 'i2-grid' },
               h('div', { className: 'i2-stack' }, promptCard, imageCard),
               latestCard,
               h('div', { className: 'i2-wide' }, historyCard)))),
-        // No row of its own: the settings entry floats over the page's corner and
-        // the content runs underneath it.
-        h(Button, {
-          variant: 'ghost',
-          size: '28px',
-          className: 'i2-float',
-          icon: h(IconGear, { size: 16 }),
-          onClick: () => { setOpenSettings(true) },
-        }, t('settingsOpen')),
         openSettings
           ? h(SettingsDialog, {
             t,
@@ -1199,6 +1708,16 @@ window.__ModuleLoader__.load({
             busy,
             onConfirm: () => { removeEntries(pending) },
             onCancel: () => { setPending(null) },
+          }),
+        // The host's lightbox owns its own portal, Escape and focus restore, so
+        // the page only says which picture is being looked at.
+        preview === null
+          ? null
+          : h(ImageLightbox, {
+            src: preview.src,
+            alt: preview.alt,
+            labels: { dialog: t('lightboxDialog'), close: t('lightboxClose') },
+            onClose: () => { setPreview(null) },
           }))
     }
 

@@ -61,6 +61,15 @@
     background: color-mix(in srgb, var(--dsw-alias-label-primary) 8%, transparent); }
   .i2m-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .i2m-check { flex: none; width: 14px; font-size: 11px; line-height: 14px; text-align: center; }
+  /* Stand-in chrome for the lightbox primitive; the host's own tokens win. */
+  .i2x-lightbox { position: fixed; inset: 0; z-index: 1000; display: flex;
+    align-items: center; justify-content: center; padding: 40px;
+    background: var(--dsw-alias-bg-mask-1, rgba(8, 8, 10, .6)); }
+  .i2x-lightboxImage { max-width: min(100%, 1600px); max-height: 100%; object-fit: contain;
+    border-radius: var(--dsw-radius-lg, 12px); box-shadow: 0 24px 64px -24px rgba(0, 0, 0, .6); }
+  .i2x-lightboxClose { position: fixed; top: 20px; right: 20px; width: 36px; height: 36px;
+    border: 1px solid var(--dsw-alias-border-l2); border-radius: 999px; cursor: pointer;
+    background: var(--dsw-specific-input-major, #202024); color: var(--dsw-alias-label-primary); }
 </style>
 <script src="./vendor/react.js"></script>
 <script src="./vendor/react-dom.js"></script>
@@ -116,13 +125,46 @@
         : null)
   }
 
+  /* Stand-in for the host's `ImageLightbox` (ui-primitives). The real one portals
+     a document-level dialog that closes on Escape, the backdrop or its close
+     control and restores focus to the opener; this keeps those props and dismiss
+     paths so the harness can exercise the wiring. Its styling is NOT the
+     reference — the host primitive's own tokens are. */
+  const ImageLightbox = function ImageLightbox(props) {
+    const { src, alt, labels, onClose } = props
+    React.useEffect(() => {
+      const onKeyDown = event => {
+        if (event.key !== 'Escape') return
+        event.stopPropagation()
+        onClose()
+      }
+      window.addEventListener('keydown', onKeyDown, true)
+      return () => { window.removeEventListener('keydown', onKeyDown, true) }
+    }, [onClose])
+    return ReactDOM.createPortal(
+      React.createElement('div', {
+        className: 'i2x-lightbox',
+        role: 'dialog',
+        'aria-modal': 'true',
+        'aria-label': labels.dialog,
+      },
+      React.createElement('img', { className: 'i2x-lightboxImage', src, alt }),
+      React.createElement('button', {
+        type: 'button',
+        className: 'i2x-lightboxClose',
+        'aria-label': labels.close,
+        onClick: onClose,
+      }, '\u2715')),
+      document.body)
+  }
+
   const dictionaries = {}
   window.__ModuleLoader__ = {
     load({ factory }) {
       const require = spec => {
         if (spec === 'react') return React
         if (spec === 'react-dom') return ReactDOM
-        if (spec === '@deepseek-ai/dsh-client-ui-primitives') return { Button, Menu }
+        if (spec === '@deepseek-ai/dsh-client-ui-primitives') return { Button, Menu, ImageLightbox }
         throw new Error('preview: unsupported module ' + spec)
       }
       window.__client = factory(require)
@@ -136,9 +178,15 @@
     quality: 'auto',
     size: '16:9',
     background: 'auto',
+    timeoutSeconds: '180',
     hasApiKey: params.get('nokey') === '1' ? false : true,
     apiKeyHint: '\u2022\u2022\u2022\u20221234',
   }
+
+  /* The run the page is holding open, so `/cancel` has something to stop: the
+     generate stub parks its resolver here and the cancel stub releases it with
+     the cancelled envelope the Host would send. */
+  let pendingRun = null
 
   /* the pictures the gallery stubs: real local files, so the shot shows real pixels */
   const ASSETS = {
@@ -149,7 +197,7 @@
     p5: 'fox.webp',
     p6: 'comp.png',
   }
-  const HISTORY = params.get('empty') === '1' ? [] : [
+  const STUBS = [
     { id: 'p1', file: 'C:\\Users\\Yangtao\\Pictures\\image2\\image2-20261025-214119-0j9luq.png', mediaType: 'image/png', bytes: 1221239, size: '1672x940', kind: 'generate', createdAt: '2026-10-25T21:41:19.000Z', prompt: 'A small fox curled up asleep in a snowdrift, soft morning light.', revisedPrompt: 'A small fox curled up asleep in a snowdrift, soft morning light, shallow depth of field.' },
     { id: 'p2', file: 'C:\\Users\\Yangtao\\Pictures\\image2\\image2-20261025-214002-a1b2c3.png', mediaType: 'image/png', bytes: 308267, size: '1440x1200', kind: 'generate', createdAt: '2026-10-25T21:40:02.000Z', prompt: 'A dark image studio panel on a laptop screen.' },
     { id: 'p3', file: 'C:\\Users\\Yangtao\\Pictures\\image2\\image2-20261025-213840-d4e5f6.png', mediaType: 'image/png', bytes: 153602, size: '1440x1200', kind: 'generate', createdAt: '2026-10-25T21:38:40.000Z', prompt: 'A light mode settings panel.' },
@@ -157,23 +205,55 @@
     { id: 'p5', file: 'C:\\Users\\Yangtao\\Pictures\\image2\\image2-20261025-213540-j1k2l3.png', mediaType: 'image/webp', bytes: 17682, size: '384x384', kind: 'generate', createdAt: '2026-10-25T21:35:40.000Z', prompt: 'The fox mascot on transparency.' },
     { id: 'p6', file: 'C:\\Users\\Yangtao\\Pictures\\image2\\image2-20261025-213422-m4n5o6.png', mediaType: 'image/png', bytes: 1221239, size: '1672x940', kind: 'generate', createdAt: '2026-10-25T21:34:22.000Z', prompt: 'A wide hero picture of the studio.' },
   ]
+  /* `?count=14` repeats the stubs under suffixed ids, long enough to page. */
+  const HISTORY = params.get('empty') === '1' ? [] : Array.from(
+    { length: Number(params.get('count') ?? STUBS.length) },
+    (_, index) => {
+      const stub = STUBS[index % STUBS.length]
+      return index < STUBS.length ? stub : { ...stub, id: `${stub.id}#${index}` }
+    })
 
   const realFetch = window.fetch.bind(window)
   const reply = value => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } })
-  window.fetch = async path => {
+  window.fetch = async (path, init) => {
     const url = new URL(path, location.href)
-    if (url.pathname === '/api/image2/settings') return reply({ ok: true, value: SETTINGS })
+    if (url.pathname === '/api/image2/settings') {
+      /* A POST is the settings form saving: keep the body so a test can read what
+         the page sent, and merge it into the answers like the Host would. */
+      if (init?.body !== undefined) {
+        window.__lastSettingsBody = String(init.body)
+        Object.assign(SETTINGS, JSON.parse(String(init.body)))
+      }
+      return reply({ ok: true, value: SETTINGS })
+    }
     if (url.pathname === '/api/image2/history') return reply({ ok: true, value: { items: HISTORY } })
     if (url.pathname === '/api/image2/asset') {
-      const file = ASSETS[url.searchParams.get('id')] ?? 'comp.png'
+      const key = String(url.searchParams.get('id')).split('#')[0]
+      const file = ASSETS[key] ?? 'comp.png'
       return realFetch(new URL(file, location.href))
     }
     if (url.pathname === '/api/image2/history/delete') {
       return reply({ ok: true, value: { items: HISTORY } })
     }
     if (url.pathname === '/api/image2/generate') {
-      await new Promise(resolve => setTimeout(resolve, 80))
-      return reply({ ok: true, value: { item: HISTORY[0], items: HISTORY } })
+      /* `?delay=2600` keeps the run open long enough to read the button clock; it
+         answers on its own unless the page cancels first. */
+      const delay = Number(params.get('delay') ?? 80)
+      return await new Promise(resolve => {
+        const timer = setTimeout(() => {
+          pendingRun = null
+          resolve(reply({ ok: true, value: { item: HISTORY[0], items: HISTORY } }))
+        }, delay)
+        pendingRun = () => {
+          clearTimeout(timer)
+          pendingRun = null
+          resolve(reply({ ok: false, code: 'cancelled', error: 'cancelled in preview' }))
+        }
+      })
+    }
+    if (url.pathname === '/api/image2/cancel') {
+      if (pendingRun !== null) pendingRun()
+      return reply({ ok: true, value: { cancelled: true } })
     }
     return reply({ ok: false, code: 'internal-error', error: 'preview stub: ' + path })
   }
@@ -184,10 +264,13 @@
   const locale = {
     register(namespace, entries) { dictionaries[namespace] = entries; return () => {} },
     bind(namespace) {
-      return key => {
+      return (key, params) => {
         const entries = dictionaries[namespace]
         const table = entries?.[lang] ?? entries?.en ?? {}
-        return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : key
+        const text = Object.prototype.hasOwnProperty.call(table, key) ? table[key] : key
+        return params === undefined
+          ? text
+          : text.replace(/\{(\w+)\}/g, (match, name) => (name in params ? String(params[name]) : match))
       }
     },
   }
