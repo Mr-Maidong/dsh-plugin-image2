@@ -443,7 +443,7 @@ window.__ModuleLoader__.load({
 .i2-notice { display:flex; flex-direction:column; gap:2px; margin-top:12px; font-size:12px; line-height:18px; }
 .i2-notice-ok { color:var(--dsw-alias-state-success-primary); }
 .i2-notice-error { color:var(--dsw-alias-state-error-primary); }
-.i2-detail { font-family:var(--dsw-font-family); font-size:11px; line-height:16px;
+.i2-detail { font-size:11px; line-height:16px;
   color:var(--dsw-alias-label-secondary); word-break:break-word; }
 
 .i2-empty { display:flex; align-items:center; justify-content:center; min-height:280px; padding:20px;
